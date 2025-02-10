@@ -175,14 +175,22 @@ impl ByteStream {
         Ok(())
     }
 
-    // pub fn jump_to_sector(&mut self, amount: u64) -> io::Result<()> {
-    //     self.jump_to_byte(amount * SECTOR_SIZE as u64)
-    // }
+    pub fn jump_to_sector(&mut self, amount: u64) -> io::Result<()> {
+        self.jump_to_byte(amount * SECTOR_SIZE as u64)
+    }
 
-    // pub fn jump_to_byte(&mut self, amount: u64) -> io::Result<()> {
-    //     self.reader.seek(SeekFrom::Start(amount))?;
-    //     Ok(())
-    // }
+    pub fn jump_to_byte(&mut self, amount: u64) -> io::Result<()> {
+        self.reader.seek(SeekFrom::Start(amount))?;
+        self.refill_buffer()?;
+        Ok(())
+    }
+
+    fn refill_buffer(&mut self) -> io::Result<()> {
+        let mut buffer = vec![0u8; SECTOR_SIZE];
+        self.reader.read_exact(&mut buffer)?;
+        self.cursor = Cursor::new(buffer);
+        Ok(())
+    }
 }
 
 pub fn interpret_bytes_as_utf16(name_bytes: &[u8]) -> Result<String, FromUtf16Error> {
