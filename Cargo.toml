@@ -14,6 +14,10 @@ chrono = "0.4.23"
 csv = "1.2.1"
 eframe = "0.31.0"
 egui_extras = "0.31.0"
+thiserror = "2.0.12"
+memmap2 = "0.9.5"
+binary_struct = { path = "./binary_struct" }
+binary_struct_derive = { path = "./binary_struct_derive" }
 
 [package.metadata.deb]
 assets = [

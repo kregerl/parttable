@@ -1,0 +1,11 @@
+[package]
+name = "binary_struct"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+binary_struct_derive = { path = "../binary_struct_derive" }
+
+[lib]
+name = "binary_struct"
+path = "src/lib.rs"

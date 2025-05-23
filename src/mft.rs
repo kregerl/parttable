@@ -671,7 +671,6 @@ fn parse_mft_file_record(
                     }
                     0x30 => {
                         let start_filename = stream.get_byte_offset()?;
-                        // println!("start_filename: {}", start_filename);
                         let file_name = stream.read::<FileName>()?;
                         attributes.push((
                             start_filename,
