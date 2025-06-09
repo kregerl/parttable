@@ -16,8 +16,9 @@ eframe = "0.31.0"
 egui_extras = "0.31.0"
 thiserror = "2.0.12"
 memmap2 = "0.9.5"
-binary_struct = { path = "./binary_struct" }
-binary_struct_derive = { path = "./binary_struct_derive" }
+binary_struct = { path = "./binary_struct", features=["derive"] }
+bitmask-enum = "2.2.5"
+libc = "0.2"
 
 [package.metadata.deb]
 assets = [

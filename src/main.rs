@@ -140,160 +140,72 @@
 //     println!("Buffer: {:#?}", x);
 // }
 
-use std::{cell::Cell, fs::File, path::Path};
+use binary_struct::{BinaryStruct, Skip};
+use mapped_disk::{MappedDisk, MappedDiskResult};
+use ntfs::mft::{parse_attribute, parse_mft, NtfsReader};
+use ntfs::pbr::{parse_pbr, validate_pbr};
+use partition_tables::{gpt::parse_gpt, mbr::parse_partition_tables, GPT_PARTITION_TYPE};
 
-use binary_struct::{BinaryParse, Skip};
-use binary_struct_derive::binary_struct;
-use mbr::parse_mbr;
-use memmap2::Mmap;
-
-
-#[derive(Debug, thiserror::Error)]
-pub enum MappedDiskError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Out of bounds access at offset {0}")]
-    OutOfBounds(usize),
-}
-
-pub struct MappedDisk {
-    mmap: Mmap,
-    cursor: Cell<usize>,
-}
-
-impl MappedDisk {
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, MappedDiskError> {
-        let file = File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        Ok(Self { mmap, cursor: Cell::new(0) })
-    }
-
-    /// Read `size` bytes starting from `offset` without advancing the cursor
-    fn read_bytes_at(&self, offset: usize, size: usize) -> Result<&[u8], MappedDiskError> {
-        if offset + size > self.mmap.len() {
-            Err(MappedDiskError::OutOfBounds(offset))
-        } else {
-            Ok(&self.mmap[offset..offset + size])
-        }
-    }
-
-    /// Read bytes and interpret them as `T` starting from `offset`.
-    /// This function does not start at or advance the cursor
-    fn read_at<T>(&self, offset: usize) -> Result<T, MappedDiskError>
-    where
-        T: BinaryParse,
-    {
-        let bytes = self.read_bytes_at(offset, T::SIZE)?;
-        T::parse(bytes).map_err(|_| MappedDiskError::OutOfBounds(offset))
-    }
-
-    /// Read `size` bytes starting from the current cursor location
-    /// This function advances the cursor after a read
-    pub fn read_bytes(&self, size: usize) -> Result<&[u8], MappedDiskError> {
-        let offset = self.cursor.get();
-        self.read_bytes_at(offset, size).map(|bytes| {
-            self.cursor.set(offset + size);
-            bytes
-        })
-    }
-    
-    /// Read `size_of<T>()` bytes starting from the current cursor location
-    pub fn read<T: BinaryParse>(&self) -> Result<T, MappedDiskError> {
-        let bytes = self.read_bytes(T::SIZE)?;
-        T::parse(bytes).map_err(|_| MappedDiskError::OutOfBounds(self.cursor.get()))
-    }
-
-    /// Read `size_of<T>()` bytes starting from the current cursor location without advancing the cursor
-    pub fn peek<T: BinaryParse>(&self) -> Result<T, MappedDiskError> {
-        let offset = self.cursor.get();
-        self.read_at::<T>(offset)
-    }
-
-    /// Set cursor location in bytes
-    pub fn set_cursor(&self, offset: usize) -> Result<(), MappedDiskError> {
-        if offset > self.mmap.len() {
-            Err(MappedDiskError::OutOfBounds(offset))
-        } else {
-            self.cursor.set(offset);
-            Ok(())
-        }
-    }
-
-    /// Set the cursor to the to the current cursor location + the `offset`
-    pub fn set_cursor_relative(&self, offset: usize) -> Result<(), MappedDiskError> {
-        if self.current_offset() + offset > self.mmap.len() {
-            Err(MappedDiskError::OutOfBounds(offset))
-        } else {
-            self.cursor.set(self.current_offset() + offset);
-            Ok(())
-        }
-    }
-
-    /// Get the current cursor location
-    pub fn current_offset(&self) -> usize {
-        self.cursor.get()
-    }
-}
-
-#[binary_struct]
-pub struct MbrPartitionTableEntry {
-    bootable: u8,
-    starting_chs: [u8; 3],
-    partition_type: u8,
-    ending_chs: [u8; 3],
-    lba_start: u32,
-    num_sectors: u32,
-}
-
-impl MbrPartitionTableEntry {
-    pub fn is_extended_partition(&self) -> bool {
-        self.partition_type == 0x05 || self.partition_type == 0x0F
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bootable == 0
-            && self.starting_chs.iter().all(|byte| *byte == 0)
-            && self.partition_type == 0
-            && self.ending_chs.iter().all(|byte| *byte == 0)
-            && self.lba_start == 0
-            && self.num_sectors == 0
-    }
-}
-
-fn parse_partition_tables(disk: &MappedDisk, starting_lba: usize) {
-    disk.set_cursor((512 * starting_lba) + 446).unwrap();
-    let mut partition_table: Vec<MbrPartitionTableEntry> = Vec::new();
-    for _ in 0..4 {
-        let entry: MbrPartitionTableEntry = disk.read().unwrap();
-        let is_not_bootable = entry.bootable != 0x00 && entry.bootable != 0x80 && (0x01..0x7F).contains(&entry.bootable);
-        if entry.is_empty() || is_not_bootable {
-            break;
-        }
-        
-        if entry.is_extended_partition() {
-            parse_partition_tables(disk, entry.lba_start as usize);
-        }
-        partition_table.push(entry);
-    }
-}
-
-fn main() {
-    let disk = MappedDisk::new("sandisk2.dd").unwrap();
-    parse_partition_tables(&disk, 0);
-}
-
-mod mbr;
 mod bytestream;
+mod mapped_disk;
+mod ntfs;
+mod partition_tables;
 
 #[test]
 fn test() {
-    let path = Path::new("sandisk2.dd");
+    let high_nibble = 1u8;
+    let mut offset = -10i64;
+    println!("offset before: {:#066b}", offset);
 
-    let mbr = parse_mbr(path);
-    let mbr_node = match mbr {
-        Ok(root_node) => root_node,
-        Err(error) => panic!("Error parsing MBR: {}", error),
-    };
-
-    println!("mbr_node: {:#?}", mbr_node);
+    if high_nibble > 0 && (offset & (1 << (high_nibble * 8 - 1))) != 0 {
+        let mask = !0 << (high_nibble * 8);
+        offset |= mask;
+    }
+    println!("offset: {}", offset);
+    println!("offset  after: {:#066b}", offset);
 }
+
+
+fn main() {
+    // let disk = MappedDisk::new("/dev/sdd").unwrap();
+    let disk = MappedDisk::new("kingston_gpt.dd").unwrap();
+    let partition_table = parse_partition_tables(&disk, 0).unwrap();
+
+    if partition_table
+        .iter()
+        .any(|entry| entry.partition_type() == GPT_PARTITION_TYPE)
+    {
+        let gpt_partition_table = parse_gpt(&disk).unwrap();
+        for partition_table_entry in gpt_partition_table {
+            // Is NTFS partition
+            if partition_table_entry.partition_type() == "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7" {
+                let partition_boot_record =
+                    parse_pbr(&disk, partition_table_entry.starting_lba() as usize).unwrap();
+                let fs_reader = NtfsReader::new(
+                    &disk,
+                    &partition_boot_record,
+                    partition_table_entry.starting_lba() as usize,
+                );
+                println!(
+                    "Start of the partition boot record: {}",
+                    partition_table_entry.starting_lba()
+                );
+
+                println!("partition_boot_record: {:#?}", partition_boot_record);
+
+                parse_mft(&fs_reader, &partition_boot_record).unwrap();
+                break;
+            }
+        }
+    }
+}
+
+
+// fn main() {
+//     let disk = MappedDisk::new("kingston_gpt.dd").unwrap();
+//     disk.set_cursor(0x106550).unwrap();
+//     let x = parse_attribute(&disk).unwrap();
+//     println!("Attribute: {:#?}", x);
+//     let y = parse_attribute(&disk).unwrap();
+//     println!("Attribute 2: {:#?}", y);
+// }

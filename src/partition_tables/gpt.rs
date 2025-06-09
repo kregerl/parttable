@@ -1,15 +1,11 @@
-use crate::bytestream::{interpret_bytes_as_utf16, ByteStream, Readable, SECTOR_SIZE};
-use prettytable::{row, Table};
-use std::{
-    fmt::Display,
-    io::{self},
-    path::Path,
-    string::FromUtf16Error,
-};
+use binary_struct::prelude::*;
+use binary_struct::{BinaryStruct, Skip};
+
+use crate::mapped_disk::{MappedDisk, MappedDiskError, MappedDiskResult, SECTOR_SIZE};
 
 // https://www.ietf.org/rfc/rfc4122.txt
 // 4.1.2.  Layout and Byte Order
-#[derive(Debug)]
+#[derive(BinaryStruct, Debug)]
 struct Guid {
     // The low field of the timestamp
     time_low: u32,
@@ -23,29 +19,6 @@ struct Guid {
     clock_seq_low: u8,
     // The spatially unique node identifier
     node_identifier: [u8; 6],
-}
-
-impl Guid {
-    pub const fn new(bytes: [u8; 16]) -> Self {
-        // The first three dash-delimited fields of the GUID are stored little endian, and the last two fields are not
-        let time_low = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let time_mid = u16::from_le_bytes([bytes[4], bytes[5]]);
-        let time_high_and_version = u16::from_le_bytes([bytes[6], bytes[7]]);
-        let clock_seq_high_and_reserved = bytes[8];
-        let clock_seq_low = bytes[9];
-        let node_identifier = [
-            bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-        ];
-
-        Self {
-            time_low,
-            time_mid,
-            time_high_and_version,
-            clock_seq_high_and_reserved,
-            clock_seq_low,
-            node_identifier,
-        }
-    }
 }
 
 impl ToString for Guid {
@@ -66,41 +39,20 @@ impl ToString for Guid {
     }
 }
 
-impl Readable for Guid {
-    fn read(reader: &mut ByteStream) -> io::Result<Self>
-    where
-        Self: Sized,
-    {
-        let x = reader.read_byte_array::<16>()?;
-        Ok(Guid::new(x))
-    }
-}
-
-#[test]
-fn test_guid() {
-    // https://developer.apple.com/library/archive/technotes/tn2166/_index.html#//apple_ref/doc/uid/DTS10003927-CH1-SECTION2
-    let bytes: [u8; 16] = [
-        0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9,
-        0x3b,
-    ];
-    let guid = Guid::new(bytes);
-    assert_eq!(
-        format!("{}", guid.to_string()),
-        "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
-    )
-}
-
-#[derive(Debug)]
+#[derive(BinaryStruct, Debug)]
 struct GptHeader {
+    #[binary_struct(num_bytes = 8)]
     efi_part: String,
-    //Revision 1.0 (00h 00h 01h 00h) for UEFI 2.8
+    // Revision 1.0 (00h 00h 01h 00h) for UEFI 2.8
     revision: [u8; 4],
     // Header size in little endian (in bytes, usually 5Ch 00h 00h 00h or 92 bytes)
     header_size: u32,
     crc32: u32,
     // Reserved space of 0's
-    reserved: u32,
+    _reserved: Skip<4>,
+    // Location of this GPT header
     current_lba: u64,
+    // Location of the backup GPT header
     backup_lba: u64,
     first_usable_lba: u64,
     last_usable_lba: u64,
@@ -111,111 +63,20 @@ struct GptHeader {
     crc32_partition_entries: u32,
 }
 
-impl Readable for GptHeader {
-    fn read(reader: &mut ByteStream) -> io::Result<Self>
-    where
-        Self: Sized,
-    {
-        let efi_part_buffer = reader.read_byte_array::<8>()?;
-        let revision_buffer = reader.read_byte_array::<4>()?;
-
-        Ok(Self {
-            efi_part: String::from_utf8(efi_part_buffer.to_vec())
-                .unwrap()
-                .trim()
-                .into(),
-            revision: revision_buffer,
-            header_size: reader.read_le()?,
-            crc32: reader.read_le()?,
-            reserved: reader.read_le()?,
-            current_lba: reader.read_le()?,
-            backup_lba: reader.read_le()?,
-            first_usable_lba: reader.read_le()?,
-            last_usable_lba: reader.read_le()?,
-            disk_guid: reader.read::<Guid>()?,
-            starting_lba_of_partition_entries: reader.read_le()?,
-            number_partition_entries: reader.read_le()?,
-            size_single_partition_entry: reader.read_le()?,
-            crc32_partition_entries: reader.read_le()?,
-        })
+impl GptHeader {
+    fn number_of_sectors(&self) -> u32 {
+        (self.number_partition_entries * self.size_single_partition_entry) / SECTOR_SIZE as u32
     }
 }
 
-#[derive(Debug)]
-pub struct GptPartitionTableEntry {
-    partition_type_guid: Guid,
-    unique_partition_guid: Guid,
-    starting_lba: u64,
-    ending_lba: u64,
-    attribute_flags: [u8; 8],
-    partition_name: [u8; 72],
-}
-
-impl Readable for GptPartitionTableEntry {
-    fn read(reader: &mut ByteStream) -> io::Result<Self>
-    where
-        Self: Sized,
-    {
-        let partition_type_guid = reader.read::<Guid>()?;
-        let unique_partition_guid = reader.read::<Guid>()?;
-        let starting_lba = reader.read_le()?;
-        let ending_lba = reader.read_le()?;
-        let attribute_flag_buffer = reader.read_byte_array::<8>()?;
-        let partition_name_buffer = reader.read_byte_array::<72>()?;
-        Ok(Self {
-            partition_type_guid,
-            unique_partition_guid,
-            starting_lba,
-            ending_lba,
-            attribute_flags: attribute_flag_buffer,
-            partition_name: partition_name_buffer,
-        })
-    }
-}
-
-impl GptPartitionTableEntry {
-    pub fn get_partition_type_guid(&self) -> String {
-        self.partition_type_guid.to_string()
-    }
-
-    pub fn starting_lba(&self) -> u64 {
-        self.starting_lba
-    }
-
-    fn is_empty(&self) -> bool {
-        self.starting_lba == 0
-            && self.ending_lba == 0
-            && self.attribute_flags.iter().all(|byte| *byte == 0)
-            && self.partition_name.iter().all(|byte| *byte == 0)
-    }
-
-    fn partition_name(&self) -> Result<String, FromUtf16Error> {
-        interpret_bytes_as_utf16(&self.partition_name.to_vec())
-    }
-}
-
-impl Display for GptPartitionTableEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "partition_type_guid: {}\n",
-            self.partition_type_guid.to_string()
-        )?;
-        write!(
-            f,
-            "unique_partition_guid: {}\n",
-            self.unique_partition_guid.to_string()
-        )?;
-        write!(f, "starting_lba: {}\n", self.starting_lba)?;
-        write!(f, "ending_lba: {}\n", self.ending_lba)?;
-        write!(f, "attribute_flags: {:#?}\n", self.attribute_flags)?;
-        write!(f, "partition_name: {:#?}\n", self.partition_name())
-    }
-}
-
-fn is_valid_header_crc32(path: &Path, header_size: u32, crc32: u32) -> io::Result<bool> {
-    let mut stream = ByteStream::new(path, SECTOR_SIZE, 1)?;
-    let mut header_bytes = stream.read_raw(header_size as usize)?;
+fn validate_header_crc32(
+    disk: &MappedDisk,
+    header_size: u32,
+    crc32: u32,
+) -> MappedDiskResult<bool> {
+    let mut header_bytes = disk
+        .read_bytes_starting_at_sector(1, header_size as usize)?
+        .to_vec();
 
     // CRC32 of header (offset +0 to +0x5b) in little endian, with this field zeroed during calculation
     header_bytes.splice(16..20, vec![0u8; 4]);
@@ -239,72 +100,101 @@ fn calculate_crc32(bytes: Vec<u8>) -> u32 {
     !crc
 }
 
-pub fn parse_gpt(path: &Path) -> io::Result<Vec<GptPartitionTableEntry>> {
-    let mut stream = ByteStream::new(path, SECTOR_SIZE, 1)?;
-    // stream.jump_to_sector(1)?;
-    let header = stream.read::<GptHeader>()?;
+#[derive(BinaryStruct, Debug)]
+pub struct GptPartitionTableEntry {
+    partition_type_guid: Guid,
+    unique_partition_guid: Guid,
+    starting_lba: u64,
+    ending_lba: u64,
+    attribute_flags: [u8; 8],
+    partition_name: [u8; 72],
+}
 
-    if header.efi_part == "EFI PART" {
-        //FIXME: Throw error if invalid header.
+impl GptPartitionTableEntry {
+    fn is_empty(&self) -> bool {
+        self.starting_lba == 0
+            && self.ending_lba == 0
+            && self.attribute_flags.iter().all(|byte| *byte == 0)
+            && self.partition_name.iter().all(|byte| *byte == 0)
     }
 
-    println!("Header guid: {}", header.disk_guid.to_string());
-    println!();
-    if !is_valid_header_crc32(path, header.header_size, header.crc32)? {
-        // FIXME: Check backup header if crc32 fails.
+    pub fn partition_type(&self) -> String {
+        self.partition_type_guid.to_string()
     }
 
-    let number_of_sectors =
-        (header.number_partition_entries * header.size_single_partition_entry) / SECTOR_SIZE as u32;
-
-    let buffer = stream.read_raw_sectors_from_file(
-        header.starting_lba_of_partition_entries as usize,
-        number_of_sectors as usize,
-    )?;
-
-    if calculate_crc32(buffer) != header.crc32_partition_entries {
-        // FIXME: Check backup header if crc32 fails.
+    pub fn starting_lba(&self) -> u64 {
+        self.starting_lba
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GptParseError {
+    #[error("Mapped Disk Error: {0}")]
+    MappedDisk(#[from] MappedDiskError),
+    #[error("Could not parse GPT header, 'EFI PART' not found")]
+    InvalidSignature,
+    #[error(
+        "CRC32 mismatch in partition table entreis: expected {expected:#010x} got {actual:#010x}"
+    )]
+    Crc32Mismatch { expected: u32, actual: u32 },
+}
+
+fn parse_gpt_header(disk: &MappedDisk) -> Result<GptHeader, GptParseError> {
+    let mut header = disk.read::<GptHeader>()?;
+    if header.efi_part != "EFI PART" {
+        return Err(GptParseError::InvalidSignature);
+    }
+
+    if !validate_header_crc32(&disk, header.header_size, header.crc32)? {
+        disk.set_cursor_from_lba(header.backup_lba as usize)?;
+        header = parse_gpt_header(disk)?;
+    }
+    Ok(header)
+}
+
+fn validate_partition_entries_crc32(
+    disk: &MappedDisk,
+    header: &GptHeader,
+) -> Result<(), GptParseError> {
+
+    let buffer = disk
+        .read_sectors_at(
+            header.starting_lba_of_partition_entries as usize,
+            header.number_of_sectors() as usize,
+        )?
+        .to_vec();
+
+    let crc32 = calculate_crc32(buffer);
+    if crc32 != header.crc32_partition_entries {
+        return Err(GptParseError::Crc32Mismatch {
+            expected: header.crc32_partition_entries,
+            actual: crc32,
+        });
+    }
+    Ok(())
+}
+
+pub fn parse_gpt(disk: &MappedDisk) -> Result<Vec<GptPartitionTableEntry>, GptParseError> {
+    disk.set_cursor_from_lba(1)?;
+    let header = parse_gpt_header(&disk)?;
+
+    validate_partition_entries_crc32(disk, &header)?;
 
     let mut partition_table = Vec::new();
-    'outer: for index in 0..number_of_sectors {
+    'outer: for index in 0..header.number_of_sectors() {
         let sector_lba = header.starting_lba_of_partition_entries + index as u64;
-        let mut table_stream = ByteStream::new(&path, SECTOR_SIZE * 32, sector_lba)?;
+        disk.set_cursor_from_lba(sector_lba as usize)?;
 
         loop {
-            let partition_table_entry = table_stream.read::<GptPartitionTableEntry>()?;
+            let partition_table_entry = disk.read::<GptPartitionTableEntry>()?;
             if partition_table_entry.is_empty() {
                 break 'outer;
             }
             partition_table.push(partition_table_entry);
         }
     }
-    Ok(partition_table)
-}
 
-pub fn display_gpt(partition_table_entries: Vec<GptPartitionTableEntry>) {
-    let mut table = Table::new();
-    // TODO: Partition Attributes
-    // https://en.wikipedia.org/wiki/GUID_Partition_Table#:~:text=The%20GUID%20Partition%20Table%20(GPT,globally%20unique%20identifiers%20(GUIDs).
-    table.add_row(row![
-        "LBA Starting Sector",
-        "LBA Ending Sector",
-        "Total Sectors",
-        "Size (MB)",
-        "Partition Type"
-    ]);
-    for partition_table_entry in partition_table_entries {
-        let total_sectors =
-            partition_table_entry.ending_lba - partition_table_entry.starting_lba + 1;
-        table.add_row(row![
-            partition_table_entry.starting_lba,
-            partition_table_entry.ending_lba,
-            total_sectors,
-            ((total_sectors * SECTOR_SIZE as u64) as f64 / 1048576 as f64).round(),
-            lookup_partition_type(partition_table_entry.partition_type_guid)
-        ]);
-    }
-    table.printstd();
+    Ok(partition_table)
 }
 
 fn lookup_partition_type(partition_type: Guid) -> String {

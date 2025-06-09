@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-binary_struct_derive = { path = "../binary_struct_derive" }
+binary_struct_derive = { version = "0.1.0", optional=true, path = "../binary_struct_derive" }
+thiserror = "2.0.12"
+
+[features]
+default = []
+derive = ["binary_struct_derive"]
 
 [lib]
 name = "binary_struct"

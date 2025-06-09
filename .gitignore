@@ -1,4 +1,6 @@
-/target
+**/target
 *.dd
 *.001
 *.csv
+*.txt
+*.hexproj
