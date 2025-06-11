@@ -181,7 +181,7 @@ fn main() {
             if partition_table_entry.partition_type() == "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7" {
                 let partition_boot_record =
                     parse_pbr(&disk, partition_table_entry.starting_lba() as usize).unwrap();
-                let fs_reader = NtfsReader::new(
+                let mut fs_reader = NtfsReader::new(
                     &disk,
                     &partition_boot_record,
                     partition_table_entry.starting_lba() as usize,
@@ -193,7 +193,7 @@ fn main() {
 
                 println!("partition_boot_record: {:#?}", partition_boot_record);
 
-                parse_mft(&fs_reader, &partition_boot_record).unwrap();
+                parse_mft(&mut fs_reader, &partition_boot_record).unwrap();
                 break;
             }
         }

@@ -44,7 +44,6 @@ impl MappedDisk {
         if metadata.file_type().is_block_device() {
             size = get_block_device_size(&file)?;
         }
-        println!("Got size: {}", size);
         let mmap = unsafe { MmapOptions::new().len(size as usize).map(&file)? };
         Ok(Self {
             mmap,
@@ -130,6 +129,8 @@ impl MappedDisk {
 
     /// Read `size_of<T>()` bytes starting from the current cursor location
     pub fn read<T: BinaryType>(&self) -> MappedDiskResult<T> {
+        // if let Some(record_size) = f
+
         let bytes = self.read_bytes(T::SIZE)?;
         T::parse(bytes).map_err(|_| MappedDiskError::OutOfBounds(self.cursor.get()))
     }
