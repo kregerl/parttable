@@ -1,4 +1,4 @@
-use std::{cell::Cell, fs::File, os::unix::fs::FileTypeExt, path::Path};
+use std::{array::TryFromSliceError, cell::Cell, fs::File, os::unix::fs::FileTypeExt, path::Path};
 
 use binary_struct::{BinaryParse, BinaryType};
 use memmap2::{Mmap, MmapOptions};
@@ -11,6 +11,8 @@ pub enum MappedDiskError {
     Io(#[from] std::io::Error),
     #[error("Out of bounds access at offset {0}")]
     OutOfBounds(usize),
+    #[error("TryFromSlice: {0}")]
+    TryFromSlice(#[from] TryFromSliceError),
 }
 
 pub type MappedDiskResult<T> = Result<T, MappedDiskError>;
@@ -164,6 +166,85 @@ impl MappedDisk {
 
     /// Get the current cursor location
     pub fn current_offset(&self) -> usize {
+        self.cursor.get()
+    }
+}
+
+pub struct BufferedMappedDisk<'a> {
+    disk: &'a MappedDisk,
+    buffer_start_offset: usize,
+    pub buffer_size: usize,
+    pub buffer: Vec<u8>,
+    cursor: Cell<usize>
+}
+
+impl<'a> BufferedMappedDisk<'a> {
+    pub fn new(disk: &'a MappedDisk, buffer_size: usize) -> Self {
+        Self {
+            disk,
+            buffer_start_offset: disk.current_offset(),
+            buffer_size,
+            buffer: Vec::new(),
+            cursor: Cell::new(disk.current_offset() % buffer_size)
+        }
+    }
+
+    pub fn fill_buffer_at(&mut self, offset: usize) -> MappedDiskResult<()> {
+        let bytes = self.disk.read_bytes_at(offset, self.buffer_size)?;
+        self.buffer_start_offset = offset;
+        self.buffer = bytes.to_vec();
+        println!("fill_buffer_at: {:#?}", self.cursor);
+        Ok(())
+    }
+
+    pub fn read_bytes_at(&self, offset: usize, size: usize) -> MappedDiskResult<&[u8]> {
+        if offset + size > self.buffer_size {
+            Err(MappedDiskError::OutOfBounds(offset))
+        } else {
+            Ok(&self.buffer[offset..offset + size])
+        }
+    }
+
+    pub fn read_bytes(&self, size: usize) -> MappedDiskResult<&[u8]> {
+        let offset = self.cursor.get();
+        let bytes = self.read_bytes_at(offset, size);
+        self.cursor.set(offset + size);
+        bytes
+    }
+
+    pub fn read<T: BinaryType>(&self) -> MappedDiskResult<T> {
+        let bytes = self.read_bytes(T::SIZE)?;
+        T::parse(bytes).map_err(|_| MappedDiskError::OutOfBounds(self.current_buffer_offset()))
+    }
+
+    pub fn read_with_size<T: BinaryParse>(&self, size: usize) -> MappedDiskResult<T> {
+        let bytes = self.read_bytes(size)?;
+        T::parse(bytes).map_err(|_| MappedDiskError::OutOfBounds(self.current_buffer_offset()))
+    }
+
+    pub fn peek<T: BinaryType>(&self) -> MappedDiskResult<T> {
+        let offset = self.current_buffer_offset();
+        self.read_at::<T>(offset)
+    }
+
+    pub fn set_cursor(&self, offset: usize) -> MappedDiskResult<()> {
+        self.cursor.set(offset % self.buffer_size);
+        Ok(())
+    }
+
+    pub fn current_offset(&self) -> usize {
+        self.buffer_start_offset + self.current_buffer_offset()
+    }
+
+    fn read_at<T>(&self, offset: usize) -> MappedDiskResult<T>
+    where
+        T: BinaryType,
+    {
+        let bytes = self.read_bytes_at(offset, T::SIZE)?;
+        T::parse(bytes).map_err(|_| MappedDiskError::OutOfBounds(offset))
+    }
+
+    fn current_buffer_offset(&self) -> usize {
         self.cursor.get()
     }
 }

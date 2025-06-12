@@ -2,8 +2,9 @@ use std::{cell::Cell, string::FromUtf16Error};
 
 use binary_struct::{prelude::*, BinaryStruct, BinaryType, Skip};
 use bitmask_enum::bitmask;
+use eframe::glow::Buffer;
 
-use crate::mapped_disk::{MappedDisk, MappedDiskError, MappedDiskResult};
+use crate::mapped_disk::{BufferedMappedDisk, MappedDisk, MappedDiskError, MappedDiskResult};
 
 use super::pbr::{validate_pbr, NtfsPartitionBootRecord};
 
@@ -199,7 +200,7 @@ impl AttributeHeader {
     }
 }
 
-fn parse_attribute_header(disk: &NtfsReader) -> MappedDiskResult<AttributeHeader> {
+fn parse_attribute_header(disk: &BufferedMappedDisk) -> MappedDiskResult<AttributeHeader> {
     let attribute_header = disk.read::<CommonAttributeHeader>()?;
     if attribute_header.is_resident() {
         let resident_attribute_header = disk.read::<ResidentAttributeHeader>()?;
@@ -327,10 +328,10 @@ struct DataRun {
     offset: i64,
 }
 
-fn parse_dataruns(disk: &NtfsReader) -> MappedDiskResult<Vec<DataRun>> {
+fn parse_dataruns(disk: &BufferedMappedDisk) -> MappedDiskResult<Vec<DataRun>> {
     let mut dataruns = Vec::new();
-    while disk.peek_byte()? != 0 {
-        let datarun_header_byte = disk.read_byte()?;
+    while disk.peek::<u8>()? != 0 {
+        let datarun_header_byte = disk.read::<u8>()?;
         // Length is a VCN
         // i.e byte offset = length * sectors/cluster * bytes/sector
         let mut length = 0u64;
@@ -342,11 +343,11 @@ fn parse_dataruns(disk: &NtfsReader) -> MappedDiskResult<Vec<DataRun>> {
         let low_nibble = datarun_header_byte & 0b00001111;
 
         for i in 0..low_nibble as usize {
-            length |= (disk.read_byte()? as u64) << (i * 8);
+            length |= (disk.read::<u8>()? as u64) << (i * 8);
         }
 
         for i in 0..high_nibble as usize {
-            offset |= (disk.read_byte()? as i64) << (i * 8);
+            offset |= (disk.read::<u8>()? as i64) << (i * 8);
         }
 
         // Sign-extend the offset since it can be negative
@@ -505,7 +506,7 @@ pub fn interpret_bytes_as_utf16(name_bytes: &[u8]) -> Result<String, FromUtf16Er
 }
 
 fn parse_attribute_name(
-    disk: &NtfsReader,
+    disk: &BufferedMappedDisk,
     attribute_header: &CommonAttributeHeader,
 ) -> MappedDiskResult<String> {
     let name_bytes = disk.read_bytes(attribute_header.name_length as usize * 2usize)?;
@@ -515,7 +516,7 @@ fn parse_attribute_name(
 }
 
 fn parse_sid(
-    disk: &NtfsReader,
+    disk: &BufferedMappedDisk,
     ace_opt: Option<&AccessControlEntry>,
 ) -> MappedDiskResult<SecurityIdentifier> {
     match ace_opt {
@@ -532,7 +533,7 @@ fn parse_sid(
     }
 }
 
-fn parse_access_control_list(disk: &NtfsReader) -> MappedDiskResult<AccessControlList> {
+fn parse_access_control_list(disk: &BufferedMappedDisk) -> MappedDiskResult<AccessControlList> {
     let mut acl = disk.read::<AccessControlList>()?;
     for _ in 0..acl.ace_count {
         let ace = disk.read::<AccessControlEntry>()?;
@@ -687,7 +688,7 @@ struct ExtendedAttributeHeader {
 
 #[bitmask(u8)]
 pub enum ExtendedAttributeFlags {
-    NeedEA = 0x80
+    NeedEA = 0x80,
 }
 impl_binary_bitmask_parse!(ExtendedAttributeFlags, u8);
 
@@ -697,7 +698,9 @@ struct ExtendedAttribute<'a> {
     value: &'a [u8],
 }
 
-pub fn parse_attribute<'a>(disk: &'a NtfsReader) -> MappedDiskResult<Option<Attribute<'a>>> {
+pub fn parse_attribute<'a>(
+    disk: &'a BufferedMappedDisk,
+) -> MappedDiskResult<Option<Attribute<'a>>> {
     let offset_of_attribute_header = disk.current_offset();
     let attribute_header = parse_attribute_header(disk)?;
     // Sometimes resident attributes don't take up the full attribute length when they are named
@@ -833,12 +836,17 @@ pub fn parse_attribute<'a>(disk: &'a NtfsReader) -> MappedDiskResult<Option<Attr
             } else {
                 String::new()
             };
-
+            disk.set_cursor(
+                offset_of_attribute_header + attribute_header.total_attribute_length(),
+            )?;
             Ok(Some(Attribute::VolumeName(volume_name)))
         }
         0x70 => {
             // $VOLUME_INFORMATION
             let volume_information = disk.read::<VolumeInformation>()?;
+            disk.set_cursor(
+                offset_of_attribute_header + attribute_header.total_attribute_length(),
+            )?;
             Ok(Some(Attribute::VolumeInformation(volume_information)))
         }
         0x80 => {
@@ -992,7 +1000,10 @@ pub fn parse_attribute<'a>(disk: &'a NtfsReader) -> MappedDiskResult<Option<Attr
     }
 }
 
-fn parse_file_attributes(disk: &NtfsReader, starting_byte_offset: usize) -> MappedDiskResult<()> {
+fn parse_file_attributes(
+    disk: &BufferedMappedDisk,
+    starting_byte_offset: usize,
+) -> MappedDiskResult<()> {
     disk.set_cursor(starting_byte_offset)?;
     while disk.peek::<u32>()? != u32::MAX {
         // println!("starting offset: {}", disk.current_offset());
@@ -1010,10 +1021,6 @@ pub struct NtfsReader<'a> {
     sector_size: usize,
     sectors_per_cluster: usize,
     starting_lba_of_filesystem: usize,
-    // Required for the USNs
-    record_size: usize,
-    record_buffer: Vec<u8>,
-    buffer_cursor: Cell<usize>,
 }
 
 impl<'a> NtfsReader<'a> {
@@ -1027,9 +1034,6 @@ impl<'a> NtfsReader<'a> {
             sector_size: pbr.sector_size() as usize,
             sectors_per_cluster: pbr.sectors_per_cluster() as usize,
             starting_lba_of_filesystem: starting_lba_of_filesystem,
-            record_size: pbr.mft_size(),
-            record_buffer: Vec::new(),
-            buffer_cursor: Cell::new(0),
         }
     }
 
@@ -1048,107 +1052,33 @@ impl<'a> NtfsReader<'a> {
     pub fn byte_offset_from_lcn(&self, lcn: usize) -> usize {
         lcn * self.sector_size * self.sectors_per_cluster
     }
+}
 
-    // pub fn set_cursor_from_lcn(&self, lcn: usize) -> MappedDiskResult<()> {
-    //     self.disk.set_cursor(self.byte_offset_from_lcn(lcn))
-    // }
-
-    pub fn set_buffer_cursor(&self, offset: usize) -> MappedDiskResult<()> {
-        if offset > self.record_size {
-            Err(MappedDiskError::OutOfBounds(offset))
-        } else {
-            self.buffer_cursor.set(offset);
-            Ok(())
-        }
-    }
-
-    pub fn buffer_file_record_at(
-        &mut self,
-        offset: usize,
-        usn: u16,
-        usa: &[u8],
-    ) -> MappedDiskResult<()> {
-        let bytes = self.disk.read_bytes_at(offset, self.record_size)?;
-        self.record_buffer = bytes.to_vec();
-        for i in 0..(self.record_size / self.sector_size) {
-            let usn_offset = self.sector_size * i;
-            let buffer_update_sequence_number: [u8; 2] = self.record_buffer
-                [((self.sector_size - 2) + usn_offset)..(self.sector_size + usn_offset)]
+pub fn patch_update_sequence(
+    disk: &mut BufferedMappedDisk,
+    sector_size: usize,
+    update_sequence_number: u16,
+    update_sequence_array: &[u8],
+) -> MappedDiskResult<()> {
+    let number_of_sectors = disk.buffer_size / sector_size;
+    for sector_index in 0..number_of_sectors {
+        let offset_to_update_sequence = sector_size * sector_index;
+        let buffer_update_sequence_number = u16::from_le_bytes(
+            disk.buffer[((sector_size - 2) + offset_to_update_sequence)
+                ..(sector_size + offset_to_update_sequence)]
                 .try_into()
-                .unwrap();
-            let buffer_usn = u16::from_le_bytes(buffer_update_sequence_number);
-            if buffer_usn == usn {
-                let usa_offset = i * 2;
-                let usa_bytes = &usa[usa_offset..usa_offset + 2];
-                for (index, byte) in usa_bytes.iter().enumerate() {
-                    self.record_buffer[(510 + usn_offset) + index] = *byte;
-                }
+                .unwrap(),
+        );
+        if buffer_update_sequence_number == update_sequence_number {
+            let update_sequence_array_offset = sector_index * 2;
+            let update_sequence = &update_sequence_array
+                [update_sequence_array_offset..update_sequence_array_offset + 2];
+            for (index, byte) in update_sequence.iter().enumerate() {
+                disk.buffer[(510 + offset_to_update_sequence) + index] = *byte;
             }
         }
-
-        Ok(())
     }
-
-    pub fn read_bytes_at(&self, offset: usize, size: usize) -> MappedDiskResult<&[u8]> {
-        if offset + size > self.record_size {
-            Err(MappedDiskError::OutOfBounds(offset))
-        } else {
-            Ok(&self.record_buffer[offset..offset + size])
-        }
-    }
-
-    pub fn read_bytes(&self, size: usize) -> MappedDiskResult<&[u8]> {
-        let offset = self.buffer_cursor.get();
-        let disk_offset = self.disk.current_offset();
-        self.read_bytes_at(offset, size).map(|bytes| {
-            self.buffer_cursor.set(offset + size);
-            self.disk.set_cursor(disk_offset + size).unwrap();
-            bytes
-        })
-    }
-
-    pub fn read<T: BinaryType>(&self) -> MappedDiskResult<T> {
-        let bytes = self.read_bytes(T::SIZE)?;
-        T::parse(bytes).map_err(|_| MappedDiskError::OutOfBounds(self.buffer_cursor.get()))
-    }
-
-    pub fn peek<T: BinaryType>(&self) -> MappedDiskResult<T> {
-        self.disk.peek::<T>()
-    }
-
-    pub fn set_cursor(&self, offset: usize) -> MappedDiskResult<()> {
-        self.disk.set_cursor(offset)?;
-        self.buffer_cursor.set(offset % self.record_size);
-        Ok(())
-    }
-
-    pub fn current_offset(&self) -> usize {
-        self.disk.current_offset()
-    }
-
-    pub fn read_with_size<T: BinaryParse>(&self, size: usize) -> MappedDiskResult<T> {
-        let bytes = self.read_bytes(size)?;
-        T::parse(bytes).map_err(|_| MappedDiskError::OutOfBounds(self.buffer_cursor.get()))
-    }
-
-    pub fn read_byte(&self) -> MappedDiskResult<u8> {
-        let offset = self.buffer_cursor.get();
-        if offset > self.record_size {
-            Err(MappedDiskError::OutOfBounds(offset))
-        } else {
-            self.buffer_cursor.set(offset + 1);
-            Ok(self.record_buffer[offset])
-        }
-    }
-
-    pub fn peek_byte(&self) -> MappedDiskResult<u8> {
-        let offset = self.buffer_cursor.get();
-        if offset > self.record_size {
-            Err(MappedDiskError::OutOfBounds(offset))
-        } else {
-            Ok(self.record_buffer[offset])
-        }
-    }
+    Ok(())
 }
 
 pub fn parse_mft(
@@ -1174,15 +1104,8 @@ pub fn parse_mft(
             current_offset + partition_boot_record.mft_size()
         );
         fs_reader.disk.set_cursor(current_offset)?;
-        // TODO:
-        // Prevent "junk" bytes from being read when an attribute's data falls on a sector boundary
-        // - Read bytes into buffer
-        // - Read the MFT file record
-        // - Use the USNs from the MFTFileRecord to fixup the internal buffer
-        // - Use the internal NtfsReader buffer to read file attributes instead of the MappedDisk
         let file_descriptor = fs_reader.disk.read::<MftFileRecord>()?;
 
-        // FIXME: Perform fixups
         if file_descriptor.signature == "FILE" {
             println!("MftFileDescriptor: {:#?}", file_descriptor);
             fs_reader
@@ -1193,27 +1116,24 @@ pub fn parse_mft(
                 .disk
                 .read_bytes((file_descriptor.size_of_update_seq as usize - 1) * 2)?;
 
-            fs_reader.buffer_file_record_at(
-                current_offset,
+            let mut buffered_mapped_disk =
+                BufferedMappedDisk::new(fs_reader.disk, partition_boot_record.mft_size());
+            buffered_mapped_disk.fill_buffer_at(current_offset)?;
+            patch_update_sequence(
+                &mut buffered_mapped_disk,
+                partition_boot_record.sector_size() as usize,
                 update_sequence_number,
                 &update_sequence_array,
             )?;
-            // if current_offset + partition_boot_record.mft_size() == 1095680 {
-            //     println!("update_sequence_number: {:#?}", update_sequence_number);
-            //     println!("update_sequence_array: {:#?}", update_sequence_array);
-            //     println!("buffer: {:#?}", fs_reader.record_buffer);
-            //     println!("usn: {:#?}", fs_reader.record_buffer[510..512].to_vec());
-            // }
 
             parse_file_attributes(
-                fs_reader,
+                &buffered_mapped_disk,
                 current_offset + file_descriptor.offset_first_attribute as usize,
             )?;
         } else {
             // TODO: Skip
         }
         current_offset += partition_boot_record.mft_size();
-        // break;
     }
 
     Ok(())
