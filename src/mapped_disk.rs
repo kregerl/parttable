@@ -1,6 +1,7 @@
 use std::{array::TryFromSliceError, cell::Cell, fs::File, os::unix::fs::FileTypeExt, path::Path};
 
 use binary_struct::{BinaryParse, BinaryType};
+use chrono::offset;
 use memmap2::{Mmap, MmapOptions};
 
 pub const SECTOR_SIZE: usize = 512;
@@ -129,6 +130,18 @@ impl MappedDisk {
         T::parse(bytes).map_err(|_| MappedDiskError::OutOfBounds(self.cursor.get()))
     }
 
+    pub fn read_string_utf8(&self, size: usize) -> MappedDiskResult<String> {
+        let bytes = self.read_bytes(size)?;
+        Ok(String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    pub fn read_string_utf16(&self, size: usize) -> MappedDiskResult<String> {
+        let bytes = self.read_bytes(size)?;
+        let u16_iter = bytes.chunks_exact(2)
+                            .map(|b| u16::from_le_bytes([b[0], b[1]]));
+        Ok(String::from_utf16(&u16_iter.collect::<Vec<_>>()).unwrap())
+    }
+    
     /// Read `size_of<T>()` bytes starting from the current cursor location
     pub fn read<T: BinaryType>(&self) -> MappedDiskResult<T> {
         // if let Some(record_size) = f
@@ -212,6 +225,19 @@ impl<'a> BufferedMappedDisk<'a> {
         bytes
     }
 
+    pub fn read_string_utf8(&self, size: usize) -> MappedDiskResult<String> {
+        let bytes = self.read_bytes(size)?;
+        Ok(String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    pub fn read_string_utf16(&self, size: usize) -> MappedDiskResult<String> {
+        let bytes = self.read_bytes(size)?;
+        let u16_iter = bytes.chunks_exact(2)
+                            .map(|b| u16::from_le_bytes([b[0], b[1]]));
+        Ok(String::from_utf16(&u16_iter.collect::<Vec<_>>()).unwrap())
+    }
+
+
     pub fn read<T: BinaryType>(&self) -> MappedDiskResult<T> {
         let bytes = self.read_bytes(T::SIZE)?;
         T::parse(bytes).map_err(|_| MappedDiskError::OutOfBounds(self.current_buffer_offset()))
@@ -229,6 +255,11 @@ impl<'a> BufferedMappedDisk<'a> {
 
     pub fn set_cursor(&self, offset: usize) -> MappedDiskResult<()> {
         self.cursor.set(offset % self.buffer_size);
+        Ok(())
+    }
+
+    pub fn set_cursor_relative(&self, offset: usize) -> MappedDiskResult<()> {
+        self.cursor.set(self.cursor.get() + offset);
         Ok(())
     }
 

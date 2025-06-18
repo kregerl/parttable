@@ -1,39 +1,42 @@
-use std::{cell::Cell, string::FromUtf16Error};
+use std::{ops::Index, string::FromUtf16Error};
 
-use binary_struct::{prelude::*, BinaryStruct, BinaryType, Skip};
+use binary_struct::{prelude::*, BinaryStruct, Skip};
 use bitmask_enum::bitmask;
-use eframe::glow::Buffer;
+use eframe::epaint::tessellator::{path, PathType};
 
-use crate::mapped_disk::{BufferedMappedDisk, MappedDisk, MappedDiskError, MappedDiskResult};
+use crate::{
+    guid::Guid,
+    mapped_disk::{BufferedMappedDisk, MappedDisk, MappedDiskResult},
+};
 
 use super::pbr::{validate_pbr, NtfsPartitionBootRecord};
 
 macro_rules! impl_binary_bitmask_parse {
     // General implementation for all unsigned and signed integer types.
     // The enum type and inner bitmask type must be known
-    ($real_type:ty, $inner_type:ty, $from_types:expr) => {
-        impl BinaryParse for $real_type {
+    ($enum_type:ty, $inner_type:ty, $from_types:expr) => {
+        impl BinaryParse for $enum_type {
             fn parse(input: &[u8]) -> Result<Self, binary_struct::ParseError>
             where
                 Self: Sized,
             {
-                let flags = $from_types(input[..Self::SIZE].try_into()?);
+                let flags = $from_types(input[..Self::SIZE].try_into().unwrap());
                 Ok(Self::from(flags))
             }
         }
 
-        impl BinarySize for $real_type {
+        impl BinarySize for $enum_type {
             const SIZE: usize = ::core::mem::size_of::<$inner_type>();
         }
     };
 
     // Used for bitmasks of u8s only
-    ($real_type:ty, $inner_type:ty) => {
-        impl BinarySize for $real_type {
+    ($enum_type:ty, $inner_type:ty) => {
+        impl BinarySize for $enum_type {
             const SIZE: usize = ::core::mem::size_of::<Self>();
         }
 
-        impl BinaryParse for $real_type {
+        impl BinaryParse for $enum_type {
             fn parse(input: &[u8]) -> Result<Self, binary_struct::ParseError> {
                 Ok(Self::from(input[0]))
             }
@@ -146,24 +149,6 @@ impl AttributeHeader {
         }
     }
 
-    pub fn length(&self) -> u32 {
-        match self {
-            AttributeHeader::ResidentUnnamed { common, .. } => common.length,
-            AttributeHeader::ResidentNamed { common, .. } => common.length,
-            AttributeHeader::NonResidentUnnamed { common, .. } => common.length,
-            AttributeHeader::NonResidentNamed { common, .. } => common.length,
-        }
-    }
-
-    pub fn name_offset(&self) -> u16 {
-        match self {
-            AttributeHeader::ResidentUnnamed { common, .. } => common.name_offset,
-            AttributeHeader::ResidentNamed { common, .. } => common.name_offset,
-            AttributeHeader::NonResidentUnnamed { common, .. } => common.name_offset,
-            AttributeHeader::NonResidentNamed { common, .. } => common.name_offset,
-        }
-    }
-
     /// Returns the attribute length of a resident attribute
     /// Returns 0 for non-resident attributes
     pub fn resident_attribute_value_length(&self) -> u32 {
@@ -201,11 +186,11 @@ impl AttributeHeader {
 }
 
 fn parse_attribute_header(disk: &BufferedMappedDisk) -> MappedDiskResult<AttributeHeader> {
-    let attribute_header = disk.read::<CommonAttributeHeader>()?;
+    let attribute_header = disk.read::<CommonAttributeHeader>().unwrap();
     if attribute_header.is_resident() {
-        let resident_attribute_header = disk.read::<ResidentAttributeHeader>()?;
+        let resident_attribute_header = disk.read::<ResidentAttributeHeader>().unwrap();
         if attribute_header.name_length > 0 {
-            let name = parse_attribute_name(&disk, &attribute_header)?;
+            let name = parse_attribute_name(&disk, &attribute_header).unwrap();
             Ok(AttributeHeader::ResidentNamed {
                 common: attribute_header,
                 resident: resident_attribute_header,
@@ -218,9 +203,9 @@ fn parse_attribute_header(disk: &BufferedMappedDisk) -> MappedDiskResult<Attribu
             })
         }
     } else {
-        let non_resident_attribute_header = disk.read::<NonResidentAttributeHeader>()?;
+        let non_resident_attribute_header = disk.read::<NonResidentAttributeHeader>().unwrap();
         if attribute_header.name_length > 0 {
-            let name = parse_attribute_name(&disk, &attribute_header)?;
+            let name = parse_attribute_name(&disk, &attribute_header).unwrap();
             Ok(AttributeHeader::NonResidentNamed {
                 common: attribute_header,
                 non_resident: non_resident_attribute_header,
@@ -236,18 +221,20 @@ fn parse_attribute_header(disk: &BufferedMappedDisk) -> MappedDiskResult<Attribu
 }
 
 #[derive(Debug)]
-pub enum Attribute<'a> {
+pub enum Attribute {
     StandardInfomation(StandardInformation),
     FileName(FileName),
+    ObjectId(ObjectIds),
     Data(Vec<DataRun>),
     BitMap(Vec<DataRun>),
     SecurityDescriptor(SecurityDescriptor),
     VolumeName(String),
     VolumeInformation(VolumeInformation),
-    // IndexRoot
-    IndexAllocation(Vec<DataRun>),
+    IndexRoot(Vec<IndexEntry>),
+    IndexAllocation((Option<String>, Vec<DataRun>)),
+    ReparsePoint(ReparsePoint),
     EAInformation(ExtendedAttributeInformation),
-    ExtendedAttributes(Vec<ExtendedAttribute<'a>>),
+    ExtendedAttributes(Vec<ExtendedAttribute>),
 }
 
 #[derive(BinaryStruct, Debug)]
@@ -256,43 +243,48 @@ pub struct StandardInformation {
     date_time_file_modification: u64,
     date_time_mft_modification: u64,
     date_time_file_reading: u64,
-    // 0x0001	Read-Only
-    // 0x0002	Hidden
-    // 0x0004	System
-    // 0x0020	Archive
-    // 0x0040	Device (reserved)
-    // 0x0080	Normal
-    // 0x0100	Temporary
-    // 0x0200	Sparse File
-    // 0x0400	Reparse Point
-    // 0x0800	Compressed
-    // 0x1000	Offline
-    // 0x2000	Not Content Indexed
-    // 0x4000	Encrypted
-    file_permissions: u32,
+    file_permissions: DosFilePermissionFlags,
     max_number_of_versions: u32,
     version_number: u64,
 }
 
-// #[derive(BinaryStruct, Debug)]
-// pub struct NtfsV3StandardInformation {
-//     standard_information: StandardInformation,
-//     owner_id: u32,
-//     security_descriptor_id: u32,
-//     quota_changed: u64,
-//     update_sequence_number: u64,
-// }
+/// Packed u64 where the lower 48 bits contain the MFT record index and the high 16 are the sequence number
+#[derive(Debug)]
+struct FileReferenceNumber {
+    record_index: u64,
+    sequence_number: u16,
+}
+
+impl BinaryParse for FileReferenceNumber {
+    fn parse(input: &[u8]) -> Result<Self, binary_struct::ParseError>
+    where
+        Self: Sized,
+    {
+        let packed_frn = u64::from_le_bytes(input[..Self::SIZE].try_into().unwrap());
+        let record_index = packed_frn & 0x0000_FFFF_FFFF_FFFF;
+        let sequence_number = (packed_frn >> 48) as u16;
+
+        Ok(Self {
+            record_index,
+            sequence_number,
+        })
+    }
+}
+
+impl BinarySize for FileReferenceNumber {
+    const SIZE: usize = std::mem::size_of::<u64>();
+}
 
 #[derive(BinaryStruct, Debug)]
 struct FileName {
-    reference_to_parent_dir: u64,
+    reference_to_parent_dir: FileReferenceNumber,
     datetime_file_creation: u64,
     datetime_file_modification: u64,
     datetime_mft_modification: u64,
     datetime_file_reading: u64,
     file_size_allocated_on_disk: u64,
     real_file_size: u64,
-    flags: FileNameFlags,
+    flags: DosFilePermissionFlags,
     extended_attributes_and_reparse: u32,
     name_size: u8,
     namespace: u8,
@@ -301,7 +293,7 @@ struct FileName {
 }
 
 #[bitmask(u32)]
-pub enum FileNameFlags {
+pub enum DosFilePermissionFlags {
     ReadOnly = 0x0001,
     Hidden = 0x0002,
     System = 0x0004,
@@ -320,7 +312,15 @@ pub enum FileNameFlags {
     // copy from corresponding bit in MFT record
     IndexView = 0x20000000,
 }
-impl_binary_bitmask_parse!(FileNameFlags, u32, u32::from_le_bytes);
+impl_binary_bitmask_parse!(DosFilePermissionFlags, u32, u32::from_le_bytes);
+
+#[derive(BinaryStruct, Debug)]
+struct ObjectIds {
+    object_id: Guid,
+    birth_volume_id: Guid,
+    birth_object_id: Guid,
+    domain_id: Guid,
+}
 
 #[derive(Debug)]
 struct DataRun {
@@ -330,8 +330,8 @@ struct DataRun {
 
 fn parse_dataruns(disk: &BufferedMappedDisk) -> MappedDiskResult<Vec<DataRun>> {
     let mut dataruns = Vec::new();
-    while disk.peek::<u8>()? != 0 {
-        let datarun_header_byte = disk.read::<u8>()?;
+    while disk.peek::<u8>().unwrap() != 0 {
+        let datarun_header_byte = disk.read::<u8>().unwrap();
         // Length is a VCN
         // i.e byte offset = length * sectors/cluster * bytes/sector
         let mut length = 0u64;
@@ -343,11 +343,11 @@ fn parse_dataruns(disk: &BufferedMappedDisk) -> MappedDiskResult<Vec<DataRun>> {
         let low_nibble = datarun_header_byte & 0b00001111;
 
         for i in 0..low_nibble as usize {
-            length |= (disk.read::<u8>()? as u64) << (i * 8);
+            length |= (disk.read::<u8>().unwrap() as u64) << (i * 8);
         }
 
         for i in 0..high_nibble as usize {
-            offset |= (disk.read::<u8>()? as i64) << (i * 8);
+            offset |= (disk.read::<u8>().unwrap() as i64) << (i * 8);
         }
 
         // Sign-extend the offset since it can be negative
@@ -394,19 +394,6 @@ enum AceFlags {
 }
 
 impl_binary_bitmask_parse!(AceFlags, u8);
-
-// impl BinaryParse for AceFlags {
-//     fn parse(input: &[u8]) -> Result<Self, binary_struct::ParseError>
-//     where
-//         Self: Sized,
-//     {
-//         Ok(Self::from(input[0]))
-//     }
-// }
-
-// impl BinarySize for AceFlags {
-//     const SIZE: usize = std::mem::size_of::<u8>();
-// }
 
 #[derive(BinaryStruct, Debug)]
 struct SecurityDescriptorHeader {
@@ -464,7 +451,7 @@ impl BinaryParse for SecurityIdentifier {
         let nt_authority = {
             let mut tmp = Vec::from([0u8, 0u8]);
             tmp.extend(&input[2..8]);
-            u64::from_be_bytes(tmp[0..8].try_into()?)
+            u64::from_be_bytes(tmp[0..8].try_into().unwrap())
         };
         // Read sub authorities into a vec, each sub authority is 4 bytes
         let mut sub_authorities = Vec::new();
@@ -472,7 +459,8 @@ impl BinaryParse for SecurityIdentifier {
             let current_iteration_offset = i as usize * 4;
             sub_authorities.push(u32::from_le_bytes(
                 input[(8 + current_iteration_offset)..(12 + current_iteration_offset)]
-                    .try_into()?,
+                    .try_into()
+                    .unwrap(),
             ))
         }
         // Format bytes into the Windows SID format
@@ -488,31 +476,16 @@ impl BinaryParse for SecurityIdentifier {
 
 impl SecurityIdentifier {
     pub fn calculate_size(sub_authority_count: u8) -> usize {
-        // revision(1 byte) + sub authority count(1 byte) + identifier authority(6 bytes) + sub authorities (4 bytes each)
+        // revision(1 byte) + sub authority count(1 byte) + identifier authority(6 bytes) + (N * sub authorities (4 bytes each))
         1 + 1 + 6 + (sub_authority_count as usize * 4)
     }
-}
-
-pub fn interpret_bytes_as_utf16(name_bytes: &[u8]) -> Result<String, FromUtf16Error> {
-    let num_bytes = name_bytes.len();
-    let mut unicode_symbols: Vec<u16> = Vec::with_capacity(num_bytes / 2);
-    for index in (0..num_bytes).step_by(2) {
-        // Order of top and bottom here is reversed since the bytes are in little endian
-        let first = name_bytes[index];
-        let second = name_bytes[index + 1];
-        unicode_symbols.push(((second as u16) << 8) | first as u16);
-    }
-    String::from_utf16(&unicode_symbols)
 }
 
 fn parse_attribute_name(
     disk: &BufferedMappedDisk,
     attribute_header: &CommonAttributeHeader,
 ) -> MappedDiskResult<String> {
-    let name_bytes = disk.read_bytes(attribute_header.name_length as usize * 2usize)?;
-    let name =
-        interpret_bytes_as_utf16(&name_bytes).expect("Invalid utf16 bytes in attribute header.");
-    Ok(name)
+    disk.read_string_utf16(attribute_header.name_length as usize * 2usize)
 }
 
 fn parse_sid(
@@ -524,7 +497,7 @@ fn parse_sid(
             disk.read_with_size::<SecurityIdentifier>(ace.size as usize - AccessControlEntry::SIZE)
         }
         None => {
-            let first_two_bytes_sid = disk.peek::<[u8; 2]>()?;
+            let first_two_bytes_sid = disk.peek::<[u8; 2]>().unwrap();
             let sub_authority_count = first_two_bytes_sid[1];
             disk.read_with_size::<SecurityIdentifier>(SecurityIdentifier::calculate_size(
                 sub_authority_count,
@@ -534,10 +507,10 @@ fn parse_sid(
 }
 
 fn parse_access_control_list(disk: &BufferedMappedDisk) -> MappedDiskResult<AccessControlList> {
-    let mut acl = disk.read::<AccessControlList>()?;
+    let mut acl = disk.read::<AccessControlList>().unwrap();
     for _ in 0..acl.ace_count {
-        let ace = disk.read::<AccessControlEntry>()?;
-        let sid = parse_sid(disk, Some(&ace))?;
+        let ace = disk.read::<AccessControlEntry>().unwrap();
+        let sid = parse_sid(disk, Some(&ace)).unwrap();
         acl.access_control_entries
             .push(AccessControlEntryWithSID { entry: ace, sid });
     }
@@ -596,7 +569,7 @@ struct IndexNodeHeader {
 
 #[derive(BinaryStruct, Debug)]
 struct IndexEntryHeader {
-    file_reference: u64,
+    file_reference: FileReferenceNumber,
     index_entry_length: u16,
     stream_length: u16,
     flags: IndexEntryFlags,
@@ -609,6 +582,40 @@ enum IndexEntryFlags {
     LastIndexEntry = 0x02,
 }
 impl_binary_bitmask_parse!(IndexEntryFlags, u8);
+
+#[derive(Debug)]
+pub enum IndexEntry {
+    SubNode {
+        attribute_name: String,
+        vcn: u64,
+    },
+    Sdh {
+        key: SdhIndexKey,
+        value: SdhIndexValue,
+    },
+    Sii {
+        key: SiiIndexKey,
+        value: SiiIndexValue,
+    },
+    FileName(FileName),
+    QuotaO {
+        sid: SecurityIdentifier,
+        owner_id: u32,
+    },
+    ObjIdO {
+        reference_number: FileReferenceNumber,
+        ids: ObjectIds,
+    },
+    Q {
+        owner_id: u32,
+        value: QuotaIndexValue,
+        sid: Option<SecurityIdentifier>,
+    },
+    R {
+        reparse_flags: u32,
+        reference_number: FileReferenceNumber,
+    },
+}
 
 #[derive(BinaryStruct, Debug)]
 struct SdhIndexKey {
@@ -624,14 +631,13 @@ struct SdhIndexValue {
     security_descriptor_offset: u64,
     // Size of the security descriptor in the $SDS
     security_descriptor_size: u32,
-    #[binary_struct(num_bytes = 4)]
+    #[binary_struct(num_bytes = 4, encoding = "utf16")]
     padding: String,
 }
 
 #[derive(BinaryStruct, Debug)]
 struct SiiIndexKey {
     security_id: u32,
-    // offset: u64,
 }
 
 #[derive(BinaryStruct, Debug)]
@@ -693,16 +699,62 @@ pub enum ExtendedAttributeFlags {
 impl_binary_bitmask_parse!(ExtendedAttributeFlags, u8);
 
 #[derive(Debug)]
-struct ExtendedAttribute<'a> {
+struct ExtendedAttribute {
     name: String,
-    value: &'a [u8],
+    value: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct ParsingContext {
+    pub record_number: usize,
+}
+
+#[derive(BinaryStruct, Debug)]
+struct ReparsePointHeader {
+    reparse_tag: ReparseTag,
+    reparse_data_length: u16,
+    _padding: Skip<2>,
+}
+
+#[bitmask(u32)]
+pub enum ReparseTag {
+    MountPoint = 0x3,
+    SymbolicLink = 0xc,
+    Isalias = 0x20000000,
+    IsHighLatency = 0x40000000,
+    IsMicrosoft = 0x80000000,
+}
+impl_binary_bitmask_parse!(ReparseTag, u32, u32::from_le_bytes);
+
+#[derive(BinaryStruct, Debug)]
+struct ReparseDataHeader {
+    substitute_name_offset: u16,
+    substitute_name_length: u16,
+    print_name_offset: u16,
+    print_name_length: u16,
+}
+
+#[bitmask(u32)]
+pub enum SymbolicLinkFlags {
+    Absolute = 0x0,
+    Relative = 0x1,
+}
+impl_binary_bitmask_parse!(SymbolicLinkFlags, u32, u32::from_le_bytes);
+
+#[derive(Debug)]
+struct ReparsePoint {
+    tag: ReparseTag,
+    path_type: SymbolicLinkFlags,
+    substitute_name: String,
+    path_name: String,
 }
 
 pub fn parse_attribute<'a>(
     disk: &'a BufferedMappedDisk,
-) -> MappedDiskResult<Option<Attribute<'a>>> {
+    context: &ParsingContext,
+) -> MappedDiskResult<Option<Attribute>> {
     let offset_of_attribute_header = disk.current_offset();
-    let attribute_header = parse_attribute_header(disk)?;
+    let attribute_header = parse_attribute_header(disk).unwrap();
     // Sometimes resident attributes don't take up the full attribute length when they are named
     // In the example below, the name offset tells us where the name is located,
     // which is 2*name_length bytes long. If we read the 24 bytes from the common and resident
@@ -730,12 +782,13 @@ pub fn parse_attribute<'a>(
     //     name: "$O",
     // }
     if let Some(attribute_offset) = attribute_header.resident_attribute_offset() {
-        disk.set_cursor(offset_of_attribute_header + attribute_offset as usize)?;
+        disk.set_cursor(offset_of_attribute_header + attribute_offset as usize)
+            .unwrap();
     }
     println!("attribute_header: {:#?}", attribute_header);
     match attribute_header.attribute_type() {
         0x10 => {
-            let std_info = disk.read::<StandardInformation>()?;
+            let std_info = disk.read::<StandardInformation>().unwrap();
             println!(
                 "Standard info: {:#?} at {}",
                 std_info,
@@ -747,9 +800,8 @@ pub fn parse_attribute<'a>(
             // - Quota Changed (8 bytes)
             // - Update Sequence Number (8 bytes)
             // These bytes need to be skipped so the cursor is aligned with the next attribute.
-            disk.set_cursor(
-                offset_of_attribute_header + attribute_header.total_attribute_length(),
-            )?;
+            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
+                .unwrap();
             Ok(Some(Attribute::StandardInfomation(std_info)))
         }
         0x20 => {
@@ -757,22 +809,27 @@ pub fn parse_attribute<'a>(
             todo!("$ATTRIBUTE_LIST")
         }
         0x30 => {
-            let file_name = disk.read_with_size::<FileName>(
-                attribute_header.resident_attribute_value_length() as usize,
-            )?;
-            disk.set_cursor(
-                offset_of_attribute_header + attribute_header.total_attribute_length(),
-            )?;
+            let file_name = disk
+                .read_with_size::<FileName>(
+                    attribute_header.resident_attribute_value_length() as usize
+                )
+                .unwrap();
+            println!("File name: {:#?}", file_name);
+            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
+                .unwrap();
             Ok(Some(Attribute::FileName(file_name)))
         }
         0x40 => {
             // $OBJECT_ID
-            todo!("$OBJECT_ID")
+            let object_ids = disk.read::<ObjectIds>().unwrap();
+            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
+                .unwrap();
+            Ok(Some(Attribute::ObjectId(object_ids)))
         }
         0x50 => {
             // $SECURITY_DESCRIPTOR
             let starting_offset_of_security_descriptor = disk.current_offset();
-            let security_descriptor_header = disk.read::<SecurityDescriptorHeader>()?;
+            let security_descriptor_header = disk.read::<SecurityDescriptorHeader>().unwrap();
 
             let dacl = if security_descriptor_header
                 .control_flags
@@ -781,8 +838,9 @@ pub fn parse_attribute<'a>(
                 disk.set_cursor(
                     starting_offset_of_security_descriptor
                         + security_descriptor_header.dacl_offset as usize,
-                )?;
-                Some(parse_access_control_list(disk)?)
+                )
+                .unwrap();
+                Some(parse_access_control_list(disk).unwrap())
             } else {
                 None
             };
@@ -794,8 +852,9 @@ pub fn parse_attribute<'a>(
                 disk.set_cursor(
                     starting_offset_of_security_descriptor
                         + security_descriptor_header.sacl_offset as usize,
-                )?;
-                Some(parse_access_control_list(disk)?)
+                )
+                .unwrap();
+                Some(parse_access_control_list(disk).unwrap())
             } else {
                 None
             };
@@ -804,19 +863,20 @@ pub fn parse_attribute<'a>(
             disk.set_cursor(
                 starting_offset_of_security_descriptor
                     + security_descriptor_header.user_sid_offset as usize,
-            )?;
-            let user_sid = parse_sid(disk, None)?;
+            )
+            .unwrap();
+            let user_sid = parse_sid(disk, None).unwrap();
 
             // Jump to where the group SID is
             // Offset is relative to start of SecurityDescriptorHeader
             disk.set_cursor(
                 starting_offset_of_security_descriptor
                     + security_descriptor_header.group_sid_offset as usize,
-            )?;
-            let group_sid = parse_sid(disk, None)?;
-            disk.set_cursor(
-                offset_of_attribute_header + attribute_header.total_attribute_length(),
-            )?;
+            )
+            .unwrap();
+            let group_sid = parse_sid(disk, None).unwrap();
+            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
+                .unwrap();
 
             Ok(Some(Attribute::SecurityDescriptor(SecurityDescriptor {
                 header: security_descriptor_header,
@@ -830,94 +890,139 @@ pub fn parse_attribute<'a>(
             // $VOLUME_NAME
             let name_length = attribute_header.resident_attribute_value_length();
             let volume_name = if name_length != 0 {
-                let name_bytes = disk.read_bytes(name_length as usize)?;
-                // FIXME: Do not unwrap here
-                interpret_bytes_as_utf16(name_bytes).unwrap()
+                disk.read_string_utf16(name_length as usize)?
             } else {
                 String::new()
             };
-            disk.set_cursor(
-                offset_of_attribute_header + attribute_header.total_attribute_length(),
-            )?;
+            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
+                .unwrap();
             Ok(Some(Attribute::VolumeName(volume_name)))
         }
         0x70 => {
             // $VOLUME_INFORMATION
-            let volume_information = disk.read::<VolumeInformation>()?;
-            disk.set_cursor(
-                offset_of_attribute_header + attribute_header.total_attribute_length(),
-            )?;
+            let volume_information = disk.read::<VolumeInformation>().unwrap();
+            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
+                .unwrap();
             Ok(Some(Attribute::VolumeInformation(volume_information)))
         }
         0x80 => {
             // $DATA
-            let dataruns = parse_dataruns(disk)?;
-            disk.set_cursor(
-                offset_of_attribute_header + attribute_header.total_attribute_length(),
-            )?;
+            let dataruns = parse_dataruns(disk).unwrap();
+            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
+                .unwrap();
             Ok(Some(Attribute::Data(dataruns)))
         }
         0x90 => {
             // $INDEX_ROOT
             println!("Offest: {}", disk.current_offset());
-            let index_root_header = disk.read::<IndexRootHeader>()?;
+            let index_root_header = disk.read::<IndexRootHeader>().unwrap();
             println!("index_root_header: {:#?}", index_root_header);
-            let index_header = disk.read::<IndexNodeHeader>()?;
+            let index_header = disk.read::<IndexNodeHeader>().unwrap();
             println!("index_header: {:#?}", index_header);
             let mut offset = disk.current_offset();
+            let mut index_entries: Vec<IndexEntry> = Vec::new();
             loop {
+                if attribute_header.name().is_none() {
+                    panic!("Attribute name is none");
+                }
+
+                let attribute_name = attribute_header.name().unwrap();
+
                 println!("Offest: {}", disk.current_offset());
-                let index_entry_header = disk.read::<IndexEntryHeader>()?;
-                // TODO: Sub nodes
+                let index_entry_header = disk.read::<IndexEntryHeader>().unwrap();
                 println!("index_entry_header: {:#?}", index_entry_header);
+                if index_entry_header.flags.contains(IndexEntryFlags::SubNode) {
+                    // TODO: Need attribute name for to match against the index allocation name to get the
+                    // datarun
+                    println!("SubNode offset: {}", disk.current_offset());
+                    let subnode_vcn = disk.read::<u64>().unwrap();
+                    index_entries.push(IndexEntry::SubNode {
+                        attribute_name: attribute_name.to_owned(),
+                        vcn: subnode_vcn,
+                    });
+                }
+
                 if index_entry_header
                     .flags
                     .contains(IndexEntryFlags::LastIndexEntry)
                 {
                     break;
                 }
-                if attribute_header.name().is_none() {
-                    panic!("Attribute name is none");
-                }
 
-                let attribute_name = attribute_header.name().unwrap();
-                match attribute_name {
+                let index_entry = match attribute_name {
                     "$SDH" => {
-                        println!("disk.current_offset(): {}", disk.current_offset());
-                        let sdh_key = disk.read::<SdhIndexKey>()?;
-                        let sdh_value = disk.read::<SdhIndexValue>()?;
-                        println!("sdh_key: {:#?}", sdh_key);
-                        println!("sdh_value: {:#?}", sdh_value);
-                        // todo!("SdhIndexEntry: {}", disk.current_offset());
+                        let key = disk.read::<SdhIndexKey>().unwrap();
+                        let value = disk.read::<SdhIndexValue>().unwrap();
+                        let entry = IndexEntry::Sdh { key, value };
+                        println!("Entry: {:#?}", entry);
+                        entry
                     }
                     "$SII" => {
-                        // todo!("SiiIndexEntry: {}", disk.current_offset());
-                        let sii_key = disk.read::<SiiIndexKey>()?;
-                        let sii_value = disk.read::<SiiIndexValue>()?;
-                        println!("sii_key: {:#?}", sii_key);
-                        println!("sii_value: {:#?}", sii_value);
-                        // todo!("SiiIndexEntry: {}", disk.current_offset());
+                        let key = disk.read::<SiiIndexKey>().unwrap();
+                        let value = disk.read::<SiiIndexValue>().unwrap();
+                        let entry = IndexEntry::Sii { key, value };
+                        println!("Entry: {:#?}", entry);
+                        entry
                     }
                     "$I30" => {
-                        let file_name_attribute = disk.read_with_size::<FileName>(
-                            index_entry_header.index_entry_length as usize,
-                        )?;
-                        println!("file_name_attribute: {:#?}", file_name_attribute);
+                        let file_name_attribute = disk
+                            .read_with_size::<FileName>(
+                                index_entry_header.index_entry_length as usize,
+                            )
+                            .unwrap();
+                        let entry = IndexEntry::FileName(file_name_attribute);
+                        println!("Entry: {:#?}", entry);
+                        entry
                     }
                     "$O" => {
-                        let sid = parse_sid(disk, None)?;
-                        let owner_id = disk.read::<u32>()?;
-                        println!("Sid: {:#?}", sid);
-                        println!("owner_id: {:#?}", owner_id);
+                        // If this record is $ObjId
+                        let entry = if context.record_number == 25 {
+                            let object_id = disk.read::<Guid>()?;
+                            let reference_number = disk.read::<FileReferenceNumber>()?;
+                            let birth_volume_id = disk.read::<Guid>()?;
+                            let birth_object_id = disk.read::<Guid>()?;
+                            let domain_id = disk.read::<Guid>()?;
+                            IndexEntry::ObjIdO {
+                                reference_number,
+                                ids: ObjectIds {
+                                    object_id,
+                                    birth_volume_id,
+                                    birth_object_id,
+                                    domain_id,
+                                },
+                            }
+                        } else {
+                            let sid = parse_sid(disk, None).unwrap();
+                            let owner_id = disk.read::<u32>().unwrap();
+                            IndexEntry::QuotaO { sid, owner_id }
+                        };
+
+                        println!("Entry: {:#?}", entry);
+                        entry
                     }
                     "$Q" => {
-                        let quota_owner_id = disk.read::<u32>()?;
-                        println!("owner_id: {:#?}", quota_owner_id);
-                        let quota_value = disk.read::<QuotaIndexValue>()?;
-                        println!("q_value: {:#?}", quota_value);
-                        if !quota_value.flags.contains(QuotaFlags::DefaultLimits) {
-                            let sid = parse_sid(disk, None)?;
-                            println!("sid: {:#?}", sid);
+                        let owner_id = disk.read::<u32>().unwrap();
+                        let value = disk.read::<QuotaIndexValue>().unwrap();
+                        let sid = if !value.flags.contains(QuotaFlags::DefaultLimits) {
+                            Some(parse_sid(disk, None).unwrap())
+                        } else {
+                            None
+                        };
+                        let entry = IndexEntry::Q {
+                            owner_id,
+                            value,
+                            sid,
+                        };
+                        println!("Entry: {:#?}", entry);
+                        entry
+                    }
+                    "$R" => {
+                        let reparse_flags = disk.read::<u32>()?;
+                        let reference_number = disk.read::<FileReferenceNumber>()?;
+                        let _ = disk.read::<[u8; 4]>()?;
+                        IndexEntry::R {
+                            reparse_flags,
+                            reference_number,
                         }
                     }
                     _ => {
@@ -927,40 +1032,79 @@ pub fn parse_attribute<'a>(
                             disk.current_offset()
                         );
                     }
-                }
+                };
+                index_entries.push(index_entry);
 
                 offset += index_entry_header.index_entry_length as usize;
-                disk.set_cursor(offset)?;
+                disk.set_cursor(offset).unwrap();
             }
             println!("Offest: {}", disk.current_offset());
-            Ok(None)
-            // todo!("$INDEX_ROOT")
+            Ok(Some(Attribute::IndexRoot(index_entries)))
         }
         0xA0 => {
             // $INDEX_ALLOCATION
             // FIXME: Need to perform "fixups" with update sequqnces when actually reading the non-resident
             // data
-            let dataruns = parse_dataruns(disk)?;
-            disk.set_cursor(
-                offset_of_attribute_header + attribute_header.total_attribute_length(),
-            )?;
-            Ok(Some(Attribute::IndexAllocation(dataruns)))
+            let name = attribute_header.name();
+            let dataruns = parse_dataruns(disk).unwrap();
+            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
+                .unwrap();
+            println!("Index allocation dataruns: {:#?}", dataruns);
+            Ok(Some(Attribute::IndexAllocation((
+                name.map(|s| s.to_string()),
+                dataruns,
+            ))))
         }
         0xB0 => {
             // $BITMAP
-            let dataruns = parse_dataruns(disk)?;
-            disk.set_cursor(
-                offset_of_attribute_header + attribute_header.total_attribute_length(),
-            )?;
+            let dataruns = parse_dataruns(disk).unwrap();
+            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
+                .unwrap();
             Ok(Some(Attribute::BitMap(dataruns)))
         }
         0xC0 => {
             // $REPARSE_POINT
-            todo!("$REPARSE_POINT")
+            let reparse_point_header = disk.read::<ReparsePointHeader>()?;
+            let tag = reparse_point_header.reparse_tag;
+            let reparse_point = if tag.contains(ReparseTag::IsMicrosoft) {
+                let is_symlink = tag.contains(ReparseTag::SymbolicLink);
+
+                if tag.intersects(ReparseTag::SymbolicLink.or(ReparseTag::MountPoint)) {
+                    let reparse_data_header = disk.read::<ReparseDataHeader>()?;
+
+                    let path_type = if is_symlink {
+                        disk.read::<SymbolicLinkFlags>()?
+                    } else {
+                        SymbolicLinkFlags::Absolute
+                    };
+                    let start_offset = disk.current_offset();
+                    disk.set_cursor(
+                        start_offset + reparse_data_header.substitute_name_offset as usize,
+                    )?;
+                    let substitute_name = disk.read_string_utf16(reparse_data_header.substitute_name_length as usize)?;
+
+                    disk.set_cursor(start_offset + reparse_data_header.print_name_offset as usize)?;
+                    let path_name = disk.read_string_utf16(reparse_data_header.print_name_length as usize)?;
+                    ReparsePoint {
+                        tag,
+                        path_type,
+                        substitute_name,
+                        path_name,
+                    }
+                } else {
+                    todo!("$REPARSE_POINT: {}", disk.current_offset())
+                }
+            } else {
+                todo!("$REPARSE_POINT non-microsoft: {}", disk.current_offset())
+            };
+            disk.set_cursor(
+                offset_of_attribute_header + attribute_header.total_attribute_length(),
+            )?;
+            Ok(Some(Attribute::ReparsePoint(reparse_point)))
         }
         0xD0 => {
             // $EA_INFORMATION
-            let ea_information = disk.read::<ExtendedAttributeInformation>()?;
+            let ea_information = disk.read::<ExtendedAttributeInformation>().unwrap();
             println!("ea_info: {:#?}", ea_information);
             Ok(Some(Attribute::EAInformation(ea_information)))
         }
@@ -970,31 +1114,38 @@ pub fn parse_attribute<'a>(
             let mut offset = disk.current_offset();
             loop {
                 // If the next ea offset is 0, exit the loop
-                if disk.peek::<u32>()? == 0 {
+                if disk.peek::<u32>().unwrap() == 0 {
                     break;
                 }
-                let extended_attribute = disk.read::<ExtendedAttributeHeader>()?;
+                let extended_attribute = disk.read::<ExtendedAttributeHeader>().unwrap();
                 let name = String::from_utf8(
-                    disk.read_bytes(extended_attribute.name_length as usize)?
+                    disk.read_bytes(extended_attribute.name_length as usize)
+                        .unwrap()
                         .to_vec(),
                 )
                 .unwrap();
-                let value = disk.read_bytes(extended_attribute.value_length as usize)?;
+                let value = disk
+                    .read_bytes(extended_attribute.value_length as usize)
+                    .unwrap();
 
-                extended_attributes.push(ExtendedAttribute { name, value });
+                extended_attributes.push(ExtendedAttribute {
+                    name,
+                    value: value.to_owned(),
+                });
 
                 offset += extended_attribute.next_ea_offset as usize;
-                disk.set_cursor(offset)?;
+                disk.set_cursor(offset).unwrap();
             }
-            disk.set_cursor(
-                offset_of_attribute_header + attribute_header.total_attribute_length(),
-            )?;
+            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
+                .unwrap();
             Ok(Some(Attribute::ExtendedAttributes(extended_attributes)))
-            // todo!("$EA: {}", disk.current_offset())
         }
         0x100 => {
             // $LOGGED_UTILITY_STREAM
-            todo!("$LOGGED_UTILITY_STREAM")
+            // todo!("$LOGGED_UTILITY_STREAM: {}", disk.current_offset())
+            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
+                .unwrap();
+            Ok(None)
         }
         _ => Ok(None),
     }
@@ -1003,17 +1154,17 @@ pub fn parse_attribute<'a>(
 fn parse_file_attributes(
     disk: &BufferedMappedDisk,
     starting_byte_offset: usize,
-) -> MappedDiskResult<()> {
-    disk.set_cursor(starting_byte_offset)?;
-    while disk.peek::<u32>()? != u32::MAX {
-        // println!("starting offset: {}", disk.current_offset());
-        let attribute = parse_attribute(&disk)?;
+    context: ParsingContext,
+) -> MappedDiskResult<Vec<Attribute>> {
+    disk.set_cursor(starting_byte_offset).unwrap();
+    let mut attributes: Vec<Attribute> = Vec::new();
+    while disk.peek::<u32>().unwrap() != u32::MAX {
+        let attribute = parse_attribute(&disk, &context).unwrap();
         if let Some(attr) = attribute {
-            println!("Attr: {:#?} at {}", attr, disk.current_offset());
+            attributes.push(attr);
         }
-        // println!("current offset: {:#?}", disk.current_offset());
     }
-    Ok(())
+    Ok(attributes)
 }
 
 pub struct NtfsReader<'a> {
@@ -1103,33 +1254,42 @@ pub fn parse_mft(
             "Current: {}",
             current_offset + partition_boot_record.mft_size()
         );
-        fs_reader.disk.set_cursor(current_offset)?;
-        let file_descriptor = fs_reader.disk.read::<MftFileRecord>()?;
+        fs_reader.disk.set_cursor(current_offset).unwrap();
+        let file_descriptor = fs_reader.disk.read::<MftFileRecord>().unwrap();
 
         if file_descriptor.signature == "FILE" {
+            let record_number = (current_offset - fs_reader.byte_offset_from_lba(starting_lba))
+                / partition_boot_record.mft_size();
+            println!("Entry number: {}", record_number);
             println!("MftFileDescriptor: {:#?}", file_descriptor);
             fs_reader
                 .disk
-                .set_cursor(current_offset + file_descriptor.offest_of_update_seq as usize)?;
-            let update_sequence_number = fs_reader.disk.read::<u16>()?;
+                .set_cursor(current_offset + file_descriptor.offest_of_update_seq as usize)
+                .unwrap();
+            let update_sequence_number = fs_reader.disk.read::<u16>().unwrap();
             let update_sequence_array = fs_reader
                 .disk
-                .read_bytes((file_descriptor.size_of_update_seq as usize - 1) * 2)?;
+                .read_bytes((file_descriptor.size_of_update_seq as usize - 1) * 2)
+                .unwrap();
 
             let mut buffered_mapped_disk =
                 BufferedMappedDisk::new(fs_reader.disk, partition_boot_record.mft_size());
-            buffered_mapped_disk.fill_buffer_at(current_offset)?;
+            buffered_mapped_disk.fill_buffer_at(current_offset).unwrap();
             patch_update_sequence(
                 &mut buffered_mapped_disk,
                 partition_boot_record.sector_size() as usize,
                 update_sequence_number,
                 &update_sequence_array,
-            )?;
+            )
+            .unwrap();
 
-            parse_file_attributes(
+            let attributes = parse_file_attributes(
                 &buffered_mapped_disk,
                 current_offset + file_descriptor.offset_first_attribute as usize,
-            )?;
+                ParsingContext { record_number },
+            )
+            .unwrap();
+            println!("Attributes: {:#?}", attributes)
         } else {
             // TODO: Skip
         }

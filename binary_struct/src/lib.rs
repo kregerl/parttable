@@ -1,4 +1,4 @@
-use std::array::TryFromSliceError;
+use std::{array::TryFromSliceError, fmt};
 
 #[cfg(feature = "derive")]
 pub use binary_struct_derive::BinaryStruct;
@@ -76,8 +76,14 @@ pub enum ParseError {
     TryFromSliceError(#[from] TryFromSliceError)
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Copy, Clone)]
 pub struct Skip<const N: usize>;
+
+impl<const N: usize> fmt::Debug for Skip<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Skip<{}>", N)
+    }
+}
 
 impl<const N: usize> Default for Skip<N> {
     fn default() -> Self {

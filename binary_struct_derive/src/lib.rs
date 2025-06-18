@@ -129,17 +129,28 @@ pub fn binary_struct_derive(input: TokenStream) -> TokenStream {
             struct_fields.push(quote! {
                 #field_name: #tmp_var
             });
-            // offset_expr = quote! { #offset_expr + (#src_len as usize) };
         } else if let Some(num_bytes) = num_bytes_opt {
-            // Special case: read bytes and interpret as UTF-8 string
             let tmp_var = format_ident!("__{}", field_name);
+            let offset = &offset_expr;
+            let decode_expr = match encoding.as_deref() {
+                Some("utf16") => quote! {
+                    {
+                        let byte_slice = &input[#offset..#offset + (#num_bytes as usize)];
+                        let u16_iter = byte_slice.chunks_exact(2)
+                            .map(|b| u16::from_le_bytes([b[0], b[1]]));
+                        String::from_utf16(&u16_iter.collect::<Vec<_>>()).unwrap_or_default()
+                    }
+                },
+                Some("utf8") | None => quote! {
+                    {
+                        let slice = &input[#offset..#offset + (#num_bytes as usize)];
+                        ::core::str::from_utf8(slice).unwrap_or_default().to_string()
+                    }
+                },
+                Some(enc) => panic!("Unsupported encoding: {}", enc),
+            };
             field_reads.push(quote! {
-                let #tmp_var = {
-                    let slice = &input[#offset_expr..#offset_expr + #num_bytes];
-                    // Convert to UTF-8 string, replace invalid chars
-                    let s = ::core::str::from_utf8(slice).unwrap_or_default().to_string();
-                    s
-                };
+                let #tmp_var = #decode_expr;
             });
             struct_fields.push(quote! {
                 #field_name: #tmp_var

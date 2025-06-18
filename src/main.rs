@@ -146,29 +146,15 @@ use ntfs::mft::{parse_attribute, parse_mft, NtfsReader};
 use ntfs::pbr::{parse_pbr, validate_pbr};
 use partition_tables::{gpt::parse_gpt, mbr::parse_partition_tables, GPT_PARTITION_TYPE};
 
-mod bytestream;
 mod mapped_disk;
 mod ntfs;
 mod partition_tables;
-
-#[test]
-fn test() {
-    let high_nibble = 1u8;
-    let mut offset = -10i64;
-    println!("offset before: {:#066b}", offset);
-
-    if high_nibble > 0 && (offset & (1 << (high_nibble * 8 - 1))) != 0 {
-        let mask = !0 << (high_nibble * 8);
-        offset |= mask;
-    }
-    println!("offset: {}", offset);
-    println!("offset  after: {:#066b}", offset);
-}
+mod guid;
 
 
 fn main() {
     // let disk = MappedDisk::new("/dev/sdd").unwrap();
-    let disk = MappedDisk::new("kingston_gpt.dd").unwrap();
+    let disk = MappedDisk::new("kingston_gpt_2.dd").unwrap();
     let partition_table = parse_partition_tables(&disk, 0).unwrap();
 
     if partition_table
