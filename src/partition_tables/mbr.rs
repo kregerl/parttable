@@ -36,6 +36,10 @@ impl MbrPartitionTableEntry {
     }
 
     pub fn is_bootable(&self) -> bool {
+        self.bootable == 0x80
+    }
+
+    pub fn is_valid_bootable_value(&self) -> bool {
         // https://en.wikipedia.org/wiki/Master_boot_record#PTE:
         // MBRs only accept 0x80, 0x00 means inactive, and 0x01–0x7F stand for invalid
         (self.bootable == 0x80 || self.bootable == 0x00) && !(0x01..0x7F).contains(&self.bootable)
@@ -47,6 +51,14 @@ impl MbrPartitionTableEntry {
 
     pub fn partition_type(&self) -> u8 {
         self.partition_type
+    }
+
+    pub fn partition_type_str(&self) -> &'static str {
+        lookup_partition_type(self.partition_type)
+    }
+
+    pub fn num_sectors(&self) -> u32 {
+        self.num_sectors
     }
 
     fn chs_head(chs: [u8; 3]) -> u8 {
@@ -62,23 +74,23 @@ impl MbrPartitionTableEntry {
     }
 }
 
-pub fn parse_partition_tables(
+pub fn parse_boot_records(
     disk: &MappedDisk,
     starting_lba: usize,
+    is_ebr_pointer: bool,
 ) -> MappedDiskResult<Vec<MbrPartitionTableEntry>> {
     disk.set_cursor_from_lba(starting_lba)?;
     disk.set_cursor_relative(BOOTSTRAPER_LENGTH)?;
     let mut partition_table: Vec<MbrPartitionTableEntry> = Vec::new();
     for _ in 0..4 {
         let entry: MbrPartitionTableEntry = disk.read()?;
-
-        if entry.is_empty() || !entry.is_bootable() {
+        if entry.is_empty() || !entry.is_valid_bootable_value() {
             break;
         }
 
         // If the partition is an extended partition, then we will jump to the EBR and parse the partition table there
         if entry.is_extended_partition() {
-            let child_partition_table = parse_partition_tables(disk, entry.starting_lba())?;
+            let child_partition_table = parse_boot_records(disk, starting_lba + entry.starting_lba(), true)?;
             // Extended boot records have a starting LBA that is relative to the MBR entry that points to them
             let child_entries = child_partition_table
                 .into_iter()
@@ -87,7 +99,10 @@ pub fn parse_partition_tables(
                     child_entry
                 })
                 .collect::<Vec<_>>();
-            partition_table.push(entry);
+
+            if !is_ebr_pointer {
+                partition_table.push(entry);
+            } 
             partition_table.extend(child_entries);
         } else {
             partition_table.push(entry);
@@ -96,7 +111,14 @@ pub fn parse_partition_tables(
     Ok(partition_table)
 }
 
-pub fn lookup_partition_type(partition_type: u8) -> String {
+pub fn parse_partition_tables(
+    disk: &MappedDisk,
+    starting_lba: usize,
+) -> MappedDiskResult<Vec<MbrPartitionTableEntry>> {
+    parse_boot_records(disk, starting_lba, false)
+}
+
+pub fn lookup_partition_type(partition_type: u8) -> &'static str {
     match partition_type {
         0x0 => "Empty",
         0x1 => "FAT12",
@@ -200,5 +222,4 @@ pub fn lookup_partition_type(partition_type: u8) -> String {
         0xff => "BBT",
         _ => "Unknown Partition Type",
     }
-    .into()
 }

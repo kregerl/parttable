@@ -87,8 +87,20 @@ impl GptPartitionTableEntry {
         self.partition_type_guid.to_string()
     }
 
+    pub fn partition_type_str(&self) -> &'static str {
+        lookup_partition_type(&self.partition_type_guid)
+    }
+
     pub fn starting_lba(&self) -> u64 {
         self.starting_lba
+    }
+
+    pub fn ending_lba(&self) -> u64 {
+        self.ending_lba
+    }
+    
+    pub fn number_of_sectors(&self) -> u64 {
+        self.ending_lba - self.starting_lba
     }
 }
 
@@ -162,7 +174,7 @@ pub fn parse_gpt(disk: &MappedDisk) -> Result<Vec<GptPartitionTableEntry>, GptPa
     Ok(partition_table)
 }
 
-fn lookup_partition_type(partition_type: Guid) -> String {
+fn lookup_partition_type(partition_type: &Guid) -> &'static str {
     match partition_type.to_string().as_str() {
         "C12A7328-F81F-11D2-BA4B-00A0C93EC93B" => "EFI System",
         "024DEE41-33E7-11D3-9D69-0008C781F39F" => "MBR partition scheme",
@@ -255,5 +267,4 @@ fn lookup_partition_type(partition_type: Guid) -> String {
         "2E54B353-1271-4842-806F-E436D6AF6985" => "HiFive Unleashed BBL",
         _ => "Unknown Partition Type",
     }
-    .into()
 }

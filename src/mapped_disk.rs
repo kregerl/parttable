@@ -1,7 +1,6 @@
 use std::{array::TryFromSliceError, cell::Cell, fs::File, os::unix::fs::FileTypeExt, path::Path};
 
 use binary_struct::{BinaryParse, BinaryType};
-use chrono::offset;
 use memmap2::{Mmap, MmapOptions};
 
 pub const SECTOR_SIZE: usize = 512;
