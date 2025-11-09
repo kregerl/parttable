@@ -17,6 +17,7 @@ pub enum MappedDiskError {
 
 pub type MappedDiskResult<T> = Result<T, MappedDiskError>;
 
+#[derive(Debug)]
 pub struct MappedDisk {
     mmap: Mmap,
     cursor: Cell<usize>,

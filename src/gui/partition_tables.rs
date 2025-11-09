@@ -1,4 +1,3 @@
-use byte_unit::Byte as ByteUnit;
 use eframe::egui::{
     self, Color32, CornerRadius, CursorIcon, FontId, Frame, Label, Margin, Rect, RichText, Sense,
     Stroke, Ui, Vec2,
@@ -6,10 +5,9 @@ use eframe::egui::{
 use egui_extras::{Column, TableBody, TableBuilder, TableRow};
 
 use crate::{
-    gui::AppView, mapped_disk::SECTOR_SIZE, partition_tables::{gpt::GptPartitionTableEntry, mbr::MbrPartitionTableEntry}
+    gui::{DiskContext, ViewState, utils::draw_grid},
 };
 
-use super::{draw_grid, Application};
 
 fn show_floating_menu<R>(
     ui: &mut Ui,
@@ -52,75 +50,13 @@ fn show_floating_menu<R>(
     });
 }
 
-pub trait ToTable {
-    fn headers(&self) -> Vec<&'static str>;
-    fn to_row(&self) -> Vec<String>;
-}
-
-impl ToTable for GptPartitionTableEntry {
-    fn headers(&self) -> Vec<&'static str> {
-        Vec::from([
-            "Device",
-            "Starting LBA",
-            "Ending LBA",
-            "Total Sectors",
-            "Size",
-            "Partition Type",
-        ])
-    }
-
-    fn to_row(&self) -> Vec<String> {
-        Vec::from([
-            self.starting_lba().to_string(),
-            self.ending_lba().to_string(),
-            self.number_of_sectors().to_string(),
-            format!(
-                "{:.2}",
-                ByteUnit::from_u64(self.number_of_sectors() * SECTOR_SIZE as u64)
-                    .get_appropriate_unit(byte_unit::UnitType::Binary)
-            ),
-            self.partition_type_str().to_string(),
-        ])
-    }
-}
-
-impl ToTable for MbrPartitionTableEntry {
-    fn headers(&self) -> Vec<&'static str> {
-        Vec::from([
-            "Device",
-            "Bootable",
-            "Starting LBA",
-            "Ending LBA",
-            "Total Sectors",
-            "Size",
-            "Partition Type",
-        ])
-    }
-
-    fn to_row(&self) -> Vec<String> {
-        Vec::from([
-            self.is_bootable().to_string(),
-            self.starting_lba().to_string(),
-            (self.starting_lba() + self.num_sectors() as usize - 1usize).to_string(),
-            self.num_sectors().to_string(),
-            format!(
-                "{:.2}",
-                ByteUnit::from_u64(self.num_sectors() as u64 * SECTOR_SIZE as u64)
-                    .get_appropriate_unit(byte_unit::UnitType::Binary)
-            ),
-            self.partition_type_str().to_string(),
-        ])
-    }
-}
-
-pub fn show(ui: &mut egui::Ui, app: &mut Application, ctx: &egui::Context) {
-    let path = &app.path.clone().unwrap();
-    let file_name = path.file_name().unwrap().to_str().unwrap();
-    app.load_partition_tables();
+pub fn show(ui: &mut egui::Ui, ctx: &egui::Context, disk_context: &mut DiskContext) {
+    let file_name = disk_context.path.file_name().unwrap().to_str().unwrap();
     let (headers, mut rows) = {
         (
-            app.partition_table.first().unwrap().headers(),
-            app.partition_table
+            disk_context.partition_table.first().unwrap().headers(),
+            disk_context
+                .partition_table
                 .iter()
                 .map(|entry| entry.to_row())
                 .collect::<Vec<_>>(),
@@ -145,12 +81,17 @@ pub fn show(ui: &mut egui::Ui, app: &mut Application, ctx: &egui::Context) {
     let title = format!("{} Partitions", file_name);
     ui.allocate_new_ui(builder, |ui| {
         show_floating_menu(ui, title, |ui| {
-            draw_table(ui, app, &headers, &rows);
+            draw_table(ui, disk_context, &headers, &rows);
         });
     });
 }
 
-fn draw_table(ui: &mut Ui, app: &mut Application, headers: &[&'static str], rows: &[Vec<String>]) {
+fn draw_table(
+    ui: &mut Ui,
+    disk_context: &mut DiskContext,
+    headers: &[&'static str],
+    rows: &[Vec<String>],
+) {
     Frame::default()
         .inner_margin(Margin::symmetric(6, 0))
         .show(ui, |ui| {
@@ -161,7 +102,7 @@ fn draw_table(ui: &mut Ui, app: &mut Application, headers: &[&'static str], rows
                     draw_table_headers(&mut table_header, headers);
                 })
                 .body(|mut body| {
-                    draw_table_rows(app, &mut body, rows);
+                    draw_table_rows(disk_context, &mut body, rows);
                 });
         });
 }
@@ -174,7 +115,7 @@ fn draw_table_headers(table_header: &mut TableRow, headers: &[&'static str]) {
     }
 }
 
-fn draw_table_rows(app: &mut Application, body: &mut TableBody, rows: &[Vec<String>]) {
+fn draw_table_rows(disk_context: &mut DiskContext, body: &mut TableBody, rows: &[Vec<String>]) {
     for (row_index, row_text) in rows.into_iter().enumerate() {
         body.row(18.0, |mut row| {
             for (col_index, col) in row_text.into_iter().enumerate() {
@@ -188,7 +129,7 @@ fn draw_table_rows(app: &mut Application, body: &mut TableBody, rows: &[Vec<Stri
                             response.ctx.set_cursor_icon(CursorIcon::PointingHand);
                         }
                         if response.clicked() {
-                            app.view = AppView::Partition { index: row_index };
+                            disk_context.inner = ViewState::Partition { index: row_index };
                         }
                     } else {
                         ui.label(col);

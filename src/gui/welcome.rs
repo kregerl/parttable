@@ -1,15 +1,14 @@
 use eframe::egui::{self, Pos2, RichText, Vec2};
 
-use super::{draw_grid, Application};
+use crate::gui::utils::draw_grid;
 
-pub fn show(ui: &mut egui::Ui, app: &mut Application, ctx: &egui::Context) {
+pub fn show(ui: &mut egui::Ui, ctx: &egui::Context) {
     let available = ui.available_rect_before_wrap();
 
     let painter = ui.painter();
     painter.rect_filled(available, 0.0, egui::Color32::BLACK);
 
     draw_grid(&painter, available);
-    // draw_background_grid(ctx, 40.0, egui::Color32::DARK_GRAY);
     let available = ui.available_rect_before_wrap();
     let text_size = ui.text_style_height(&egui::TextStyle::Heading);
 

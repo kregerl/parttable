@@ -1,9 +1,5 @@
-use std::{ops::Index, string::FromUtf16Error};
-
 use binary_struct::{prelude::*, BinaryStruct, Skip};
 use bitmask_enum::bitmask;
-use eframe::epaint::tessellator::{path, PathType};
-
 use crate::{
     guid::Guid,
     mapped_disk::{BufferedMappedDisk, MappedDisk, MappedDiskResult},

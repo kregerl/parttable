@@ -140,10 +140,12 @@
 //     println!("Buffer: {:#?}", x);
 // }
 
+use std::env;
 use std::path::Path;
 
 use binary_struct::{BinaryStruct, Skip};
 use gui::Application;
+use log::info;
 use mapped_disk::{MappedDisk, MappedDiskResult};
 use ntfs::mft::{parse_attribute, parse_mft, NtfsReader};
 use ntfs::pbr::{parse_pbr, validate_pbr};
@@ -163,6 +165,7 @@ fn test() {
 }
 
 fn main() {
+    info!("Startup");
     let options = eframe::NativeOptions::default();
     eframe::run_native(
         "Partition Viewer",
@@ -170,57 +173,58 @@ fn main() {
         Box::new(|_cc| Ok(Box::new(Application::new()))),
     ).unwrap();
 
-    // let disk = MappedDisk::new("/dev/sdd").unwrap();
-    // let disk = MappedDisk::new("kingston_gpt_2.dd").unwrap();
-    // let partition_table = parse_partition_tables(&disk, 0).unwrap();
+    unreachable!("Exited");
+    let disk = MappedDisk::new("/dev/sdd").unwrap();
+    let disk = MappedDisk::new("kingston_gpt_2.dd").unwrap();
+    let partition_table = parse_partition_tables(&disk, 0).unwrap();
 
-    // if partition_table
-    //     .iter()
-    //     .any(|entry| entry.partition_type() == GPT_PARTITION_TYPE)
-    // {
-    //     let gpt_partition_table = parse_gpt(&disk).unwrap();
-    //     for partition_table_entry in gpt_partition_table {
-    //         // Is NTFS partition
-    //         if partition_table_entry.partition_type() == "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7" {
-    //             let partition_boot_record =
-    //                 parse_pbr(&disk, partition_table_entry.starting_lba() as usize).unwrap();
-    //             let mut fs_reader = NtfsReader::new(
-    //                 &disk,
-    //                 &partition_boot_record,
-    //                 partition_table_entry.starting_lba() as usize,
-    //             );
-    //             println!(
-    //                 "Start of the partition boot record: {}",
-    //                 partition_table_entry.starting_lba()
-    //             );
+    if partition_table
+        .iter()
+        .any(|entry| entry.partition_type() == GPT_PARTITION_TYPE)
+    {
+        let gpt_partition_table = parse_gpt(&disk).unwrap();
+        for partition_table_entry in gpt_partition_table {
+            // Is NTFS partition
+            if partition_table_entry.partition_type() == "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7" {
+                let partition_boot_record =
+                    parse_pbr(&disk, partition_table_entry.starting_lba() as usize).unwrap();
+                let mut fs_reader = NtfsReader::new(
+                    &disk,
+                    &partition_boot_record,
+                    partition_table_entry.starting_lba() as usize,
+                );
+                println!(
+                    "Start of the partition boot record: {}",
+                    partition_table_entry.starting_lba()
+                );
 
-    //             println!("partition_boot_record: {:#?}", partition_boot_record);
+                println!("partition_boot_record: {:#?}", partition_boot_record);
 
-    //             parse_mft(&mut fs_reader, &partition_boot_record).unwrap();
-    //             break;
-    //         }
-    //     }
-    // } else {
-    //     for partition_table_entry in partition_table {
-    //         if partition_table_entry.partition_type() == 0x07 {
-    //             let partition_boot_record =
-    //                 parse_pbr(&disk, partition_table_entry.starting_lba() as usize).unwrap();
-    //             let mut fs_reader = NtfsReader::new(
-    //                 &disk,
-    //                 &partition_boot_record,
-    //                 partition_table_entry.starting_lba() as usize,
-    //             );
-    //             println!(
-    //                 "Start of the partition boot record: {}",
-    //                 partition_table_entry.starting_lba()
-    //             );
+                parse_mft(&mut fs_reader, &partition_boot_record).unwrap();
+                break;
+            }
+        }
+    } else {
+        for partition_table_entry in partition_table {
+            if partition_table_entry.partition_type() == 0x07 {
+                let partition_boot_record =
+                    parse_pbr(&disk, partition_table_entry.starting_lba() as usize).unwrap();
+                let mut fs_reader = NtfsReader::new(
+                    &disk,
+                    &partition_boot_record,
+                    partition_table_entry.starting_lba() as usize,
+                );
+                println!(
+                    "Start of the partition boot record: {}",
+                    partition_table_entry.starting_lba()
+                );
 
-    //             println!("partition_boot_record: {:#?}", partition_boot_record);
+                println!("partition_boot_record: {:#?}", partition_boot_record);
 
-    //             parse_mft(&mut fs_reader, &partition_boot_record).unwrap();
-    //         }
-    //     }   
-    // }
+                parse_mft(&mut fs_reader, &partition_boot_record).unwrap();
+            }
+        }   
+    }
 }
 
 
