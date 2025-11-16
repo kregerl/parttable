@@ -3,9 +3,12 @@ use eframe::egui::{self, CentralPanel, Frame, Stroke};
 use std::path::{Path, PathBuf};
 
 use crate::{
-    mapped_disk::{MappedDisk, SECTOR_SIZE}, ntfs::mft::NtfsReader, partition_tables::{
-        GPT_PARTITION_TYPE, gpt::{GptPartitionTableEntry, parse_gpt}, mbr::{MbrPartitionTableEntry, parse_partition_tables}
-    }
+    mapped_disk::{MappedDisk, SECTOR_SIZE},
+    partition_tables::{
+        gpt::{parse_gpt, GptPartitionTableEntry},
+        mbr::{parse_partition_tables, MbrPartitionTableEntry},
+        GPT_PARTITION_TYPE,
+    },
 };
 
 pub mod menu;
@@ -53,7 +56,7 @@ impl DiskContext {
     fn show(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         match self.inner {
             ViewState::PartitionTable => partition_tables::show(ui, ctx, self),
-            ViewState::Partition { index } => partition::show(ui, ctx, self, index)
+            ViewState::Partition { index } => partition::show(ui, ctx, self, index),
         }
     }
 }

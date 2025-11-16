@@ -1,9 +1,9 @@
+use crate::{
+    guid::Guid, log_todo, mapped_disk::{BufferedMappedDisk, MappedDisk, MappedDiskResult}, ntfs::tree::TreeNavigator
+};
 use binary_struct::{prelude::*, BinaryStruct, Skip};
 use bitmask_enum::bitmask;
-use crate::{
-    guid::Guid,
-    mapped_disk::{BufferedMappedDisk, MappedDisk, MappedDiskResult},
-};
+use eframe::glow::ATOMIC_COUNTER_BUFFER_INDEX;
 
 use super::pbr::{validate_pbr, NtfsPartitionBootRecord};
 
@@ -72,7 +72,7 @@ impl_binary_bitmask_parse!(MftFileRecordFlags, u16, u16::from_le_bytes);
 pub struct CommonAttributeHeader {
     attribute_type: u32,
     length: u32,
-    non_resident_flag: u8,
+    non_resident_flag: NonResidentFlags,
     name_length: u8,
     name_offset: u16,
     flags: AttributeHeaderFlags,
@@ -84,6 +84,13 @@ impl CommonAttributeHeader {
         self.non_resident_flag == 0
     }
 }
+
+#[bitmask(u8)]
+pub enum NonResidentFlags {
+    Resident = 0x00,
+    NonResident = 0x01,
+}
+impl_binary_bitmask_parse!(NonResidentFlags, u8, u8::from_le_bytes);
 
 #[bitmask(u16)]
 pub enum AttributeHeaderFlags {
@@ -136,13 +143,21 @@ pub enum AttributeHeader {
 }
 
 impl AttributeHeader {
-    pub fn attribute_type(&self) -> u32 {
+    pub fn common(&self) -> &CommonAttributeHeader {
         match self {
-            AttributeHeader::ResidentUnnamed { common, .. } => common.attribute_type,
-            AttributeHeader::ResidentNamed { common, .. } => common.attribute_type,
-            AttributeHeader::NonResidentUnnamed { common, .. } => common.attribute_type,
-            AttributeHeader::NonResidentNamed { common, .. } => common.attribute_type,
+            AttributeHeader::ResidentUnnamed { common, .. } => common,
+            AttributeHeader::ResidentNamed { common, .. } => common,
+            AttributeHeader::NonResidentUnnamed { common, .. } => common,
+            AttributeHeader::NonResidentNamed { common, .. } => common,
         }
+    }
+
+    pub fn attribute_type(&self) -> u32 {
+        self.common().attribute_type
+    }
+
+    pub fn total_attribute_length(&self) -> usize {
+        self.common().length as usize
     }
 
     /// Returns the attribute length of a resident attribute
@@ -161,15 +176,6 @@ impl AttributeHeader {
             AttributeHeader::ResidentNamed { resident, .. } => Some(resident.attritube_offset),
             _ => None,
         }
-    }
-
-    pub fn total_attribute_length(&self) -> usize {
-        (match self {
-            AttributeHeader::ResidentUnnamed { common, .. } => common.length,
-            AttributeHeader::ResidentNamed { common, .. } => common.length,
-            AttributeHeader::NonResidentUnnamed { common, .. } => common.length,
-            AttributeHeader::NonResidentNamed { common, .. } => common.length,
-        }) as usize
     }
 
     pub fn name(&self) -> Option<&str> {
@@ -219,6 +225,7 @@ fn parse_attribute_header(disk: &BufferedMappedDisk) -> MappedDiskResult<Attribu
 #[derive(Debug)]
 pub enum Attribute {
     StandardInfomation(StandardInformation),
+    AttributeList(AttributeList),
     FileName(FileName),
     ObjectId(ObjectIds),
     Data(Vec<DataRun>),
@@ -242,6 +249,19 @@ pub struct StandardInformation {
     file_permissions: DosFilePermissionFlags,
     max_number_of_versions: u32,
     version_number: u64,
+}
+
+#[derive(BinaryStruct, Debug)]
+pub struct AttributeList {
+    attribute_type: u32,
+    record_length: u16,
+    name_length: u8,
+    name_offset: u8,
+    starting_vcn: u64,
+    base_file_reference: FileReferenceNumber,
+    attribute_id: u16,
+    #[binary_struct(num_bytes_from = "name_length", encoding = "utf16")]
+    name: String,
 }
 
 /// Packed u64 where the lower 48 bits contain the MFT record index and the high 16 are the sequence number
@@ -282,9 +302,9 @@ struct FileName {
     real_file_size: u64,
     flags: DosFilePermissionFlags,
     extended_attributes_and_reparse: u32,
-    name_size: u8,
+    name_length: u8,
     namespace: u8,
-    #[binary_struct(num_bytes_from = "name_size", encoding = "utf16")]
+    #[binary_struct(num_bytes_from = "name_length", encoding = "utf16")]
     name: String,
 }
 
@@ -339,7 +359,8 @@ fn parse_dataruns(disk: &BufferedMappedDisk) -> MappedDiskResult<Vec<DataRun>> {
         let low_nibble = datarun_header_byte & 0b00001111;
 
         for i in 0..low_nibble as usize {
-            length |= (disk.read::<u8>().unwrap() as u64) << (i * 8);
+            let x = disk.read::<u8>().unwrap();
+            length |= (x as u64) << (i * 8);
         }
 
         for i in 0..high_nibble as usize {
@@ -782,7 +803,7 @@ pub fn parse_attribute<'a>(
             .unwrap();
     }
     println!("attribute_header: {:#?}", attribute_header);
-    match attribute_header.attribute_type() {
+    let result = match attribute_header.attribute_type() {
         0x10 => {
             let std_info = disk.read::<StandardInformation>().unwrap();
             println!(
@@ -796,13 +817,15 @@ pub fn parse_attribute<'a>(
             // - Quota Changed (8 bytes)
             // - Update Sequence Number (8 bytes)
             // These bytes need to be skipped so the cursor is aligned with the next attribute.
-            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
-                .unwrap();
-            Ok(Some(Attribute::StandardInfomation(std_info)))
+            Some(Attribute::StandardInfomation(std_info))
         }
         0x20 => {
             // $ATTRIBUTE_LIST
-            todo!("$ATTRIBUTE_LIST")
+            let attribute_list = disk.read_with_size::<AttributeList>(
+                attribute_header.resident_attribute_value_length() as usize,
+            )?;
+            // todo!("$ATTRIBUTE_LIST");
+            Some(Attribute::AttributeList(attribute_list))
         }
         0x30 => {
             let file_name = disk
@@ -811,16 +834,12 @@ pub fn parse_attribute<'a>(
                 )
                 .unwrap();
             println!("File name: {:#?}", file_name);
-            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
-                .unwrap();
-            Ok(Some(Attribute::FileName(file_name)))
+            Some(Attribute::FileName(file_name))
         }
         0x40 => {
             // $OBJECT_ID
             let object_ids = disk.read::<ObjectIds>().unwrap();
-            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
-                .unwrap();
-            Ok(Some(Attribute::ObjectId(object_ids)))
+            Some(Attribute::ObjectId(object_ids))
         }
         0x50 => {
             // $SECURITY_DESCRIPTOR
@@ -871,16 +890,14 @@ pub fn parse_attribute<'a>(
             )
             .unwrap();
             let group_sid = parse_sid(disk, None).unwrap();
-            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
-                .unwrap();
 
-            Ok(Some(Attribute::SecurityDescriptor(SecurityDescriptor {
+            Some(Attribute::SecurityDescriptor(SecurityDescriptor {
                 header: security_descriptor_header,
                 user_sid,
                 group_sid,
                 dacl,
                 sacl,
-            })))
+            }))
         }
         0x60 => {
             // $VOLUME_NAME
@@ -890,23 +907,24 @@ pub fn parse_attribute<'a>(
             } else {
                 String::new()
             };
-            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
-                .unwrap();
-            Ok(Some(Attribute::VolumeName(volume_name)))
+            Some(Attribute::VolumeName(volume_name))
         }
         0x70 => {
             // $VOLUME_INFORMATION
             let volume_information = disk.read::<VolumeInformation>().unwrap();
             disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
                 .unwrap();
-            Ok(Some(Attribute::VolumeInformation(volume_information)))
+            Some(Attribute::VolumeInformation(volume_information))
         }
         0x80 => {
             // $DATA
-            let dataruns = parse_dataruns(disk).unwrap();
-            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
-                .unwrap();
-            Ok(Some(Attribute::Data(dataruns)))
+            if attribute_header.common().non_resident_flag.contains(NonResidentFlags::NonResident) {
+                let dataruns = parse_dataruns(disk).unwrap();
+                println!("DataRun Attribute: {:#?}", dataruns);
+                Some(Attribute::Data(dataruns))
+            } else {
+                None
+            }
         }
         0x90 => {
             // $INDEX_ROOT
@@ -928,6 +946,7 @@ pub fn parse_attribute<'a>(
                 let index_entry_header = disk.read::<IndexEntryHeader>().unwrap();
                 println!("index_entry_header: {:#?}", index_entry_header);
                 if index_entry_header.flags.contains(IndexEntryFlags::SubNode) {
+                    log_todo!("Need attribute name for to match against the index allocation name to get the datarun");
                     // TODO: Need attribute name for to match against the index allocation name to get the
                     // datarun
                     println!("SubNode offset: {}", disk.current_offset());
@@ -942,6 +961,7 @@ pub fn parse_attribute<'a>(
                     .flags
                     .contains(IndexEntryFlags::LastIndexEntry)
                 {
+                    println!("Is End of Subnode: {}", attribute_name);
                     break;
                 }
 
@@ -1035,28 +1055,22 @@ pub fn parse_attribute<'a>(
                 disk.set_cursor(offset).unwrap();
             }
             println!("Offest: {}", disk.current_offset());
-            Ok(Some(Attribute::IndexRoot(index_entries)))
+            Some(Attribute::IndexRoot(index_entries))
         }
         0xA0 => {
             // $INDEX_ALLOCATION
-            // FIXME: Need to perform "fixups" with update sequqnces when actually reading the non-resident
-            // data
             let name = attribute_header.name();
             let dataruns = parse_dataruns(disk).unwrap();
-            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
-                .unwrap();
             println!("Index allocation dataruns: {:#?}", dataruns);
-            Ok(Some(Attribute::IndexAllocation((
+            Some(Attribute::IndexAllocation((
                 name.map(|s| s.to_string()),
                 dataruns,
-            ))))
+            )))
         }
         0xB0 => {
             // $BITMAP
             let dataruns = parse_dataruns(disk).unwrap();
-            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
-                .unwrap();
-            Ok(Some(Attribute::BitMap(dataruns)))
+            Some(Attribute::BitMap(dataruns))
         }
         0xC0 => {
             // $REPARSE_POINT
@@ -1077,10 +1091,12 @@ pub fn parse_attribute<'a>(
                     disk.set_cursor(
                         start_offset + reparse_data_header.substitute_name_offset as usize,
                     )?;
-                    let substitute_name = disk.read_string_utf16(reparse_data_header.substitute_name_length as usize)?;
+                    let substitute_name = disk
+                        .read_string_utf16(reparse_data_header.substitute_name_length as usize)?;
 
                     disk.set_cursor(start_offset + reparse_data_header.print_name_offset as usize)?;
-                    let path_name = disk.read_string_utf16(reparse_data_header.print_name_length as usize)?;
+                    let path_name =
+                        disk.read_string_utf16(reparse_data_header.print_name_length as usize)?;
                     ReparsePoint {
                         tag,
                         path_type,
@@ -1093,16 +1109,13 @@ pub fn parse_attribute<'a>(
             } else {
                 todo!("$REPARSE_POINT non-microsoft: {}", disk.current_offset())
             };
-            disk.set_cursor(
-                offset_of_attribute_header + attribute_header.total_attribute_length(),
-            )?;
-            Ok(Some(Attribute::ReparsePoint(reparse_point)))
+            Some(Attribute::ReparsePoint(reparse_point))
         }
         0xD0 => {
             // $EA_INFORMATION
             let ea_information = disk.read::<ExtendedAttributeInformation>().unwrap();
             println!("ea_info: {:#?}", ea_information);
-            Ok(Some(Attribute::EAInformation(ea_information)))
+            Some(Attribute::EAInformation(ea_information))
         }
         0xE0 => {
             // $EA
@@ -1132,19 +1145,19 @@ pub fn parse_attribute<'a>(
                 offset += extended_attribute.next_ea_offset as usize;
                 disk.set_cursor(offset).unwrap();
             }
-            disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
-                .unwrap();
-            Ok(Some(Attribute::ExtendedAttributes(extended_attributes)))
+            Some(Attribute::ExtendedAttributes(extended_attributes))
         }
         0x100 => {
             // $LOGGED_UTILITY_STREAM
             // todo!("$LOGGED_UTILITY_STREAM: {}", disk.current_offset())
             disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())
                 .unwrap();
-            Ok(None)
+            None
         }
-        _ => Ok(None),
-    }
+        _ => None,
+    };
+    disk.set_cursor(offset_of_attribute_header + attribute_header.total_attribute_length())?;
+    Ok(result)
 }
 
 fn parse_file_attributes(
@@ -1182,6 +1195,14 @@ impl<'a> NtfsReader<'a> {
             sectors_per_cluster: pbr.sectors_per_cluster() as usize,
             starting_lba_of_filesystem: starting_lba_of_filesystem,
         }
+    }
+
+    pub fn sector_size(&self) -> usize {
+        self.sector_size
+    }
+
+    pub fn cluster_size(&self) -> usize {
+        self.sector_size * self.sectors_per_cluster
     }
 
     // pub fn starting_offset_of_filesystem(&self) -> usize {
@@ -1237,6 +1258,8 @@ pub fn parse_mft(
         fs_reader.starting_lba_of_filesystem as u64,
     )
     .unwrap();
+    let mut tree = TreeNavigator::new(0);
+    tree.create_root("Root");
     println!("starting_lba: {}", starting_lba);
     let mut current_offset = fs_reader.byte_offset_from_lba(starting_lba);
     println!(
@@ -1285,12 +1308,18 @@ pub fn parse_mft(
                 ParsingContext { record_number },
             )
             .unwrap();
-            println!("Attributes: {:#?}", attributes)
+            println!("Attributes: {:#?}", attributes);
+            for attribute in attributes {
+                if let Attribute::FileName(name_attr) = attribute {
+                    tree.add(&name_attr.name);
+                }
+            }
         } else {
             // TODO: Skip
         }
         current_offset += partition_boot_record.mft_size();
     }
+    println!("File Tree: {:#?}", tree);
 
     Ok(())
 }

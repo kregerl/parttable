@@ -144,18 +144,20 @@ use std::env;
 use std::path::Path;
 
 use binary_struct::{BinaryStruct, Skip};
+use env_logger::Env;
 use gui::Application;
-use log::info;
+use log::{debug, info};
 use mapped_disk::{MappedDisk, MappedDiskResult};
 use ntfs::mft::{parse_attribute, parse_mft, NtfsReader};
 use ntfs::pbr::{parse_pbr, validate_pbr};
 use partition_tables::{gpt::parse_gpt, mbr::parse_partition_tables, GPT_PARTITION_TYPE};
 
+mod gui;
+mod guid;
 mod mapped_disk;
 mod ntfs;
 mod partition_tables;
-mod guid;
-mod gui;
+mod dbglog;
 
 #[test]
 fn test() {
@@ -165,17 +167,22 @@ fn test() {
 }
 
 fn main() {
+    env_logger::Builder::from_env(Env::default().default_filter_or("debug"))
+        .filter_module("parttable", log::LevelFilter::Debug)
+        .filter_level(log::LevelFilter::Info)
+        .init();
     info!("Startup");
     let options = eframe::NativeOptions::default();
     eframe::run_native(
         "Partition Viewer",
         options,
         Box::new(|_cc| Ok(Box::new(Application::new()))),
-    ).unwrap();
+    )
+    .unwrap();
 
     unreachable!("Exited");
     let disk = MappedDisk::new("/dev/sdd").unwrap();
-    let disk = MappedDisk::new("kingston_gpt_2.dd").unwrap();
+    let disk = MappedDisk::new("kingston_mbr.dd").unwrap();
     let partition_table = parse_partition_tables(&disk, 0).unwrap();
 
     if partition_table
@@ -223,10 +230,9 @@ fn main() {
 
                 parse_mft(&mut fs_reader, &partition_boot_record).unwrap();
             }
-        }   
+        }
     }
 }
-
 
 // fn main() {
 //     let disk = MappedDisk::new("kingston_gpt.dd").unwrap();
