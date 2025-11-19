@@ -7,7 +7,7 @@ struct NtfsNode {
 }
 
 #[derive(Debug)]
-struct Arena {
+pub struct Arena {
     nodes: Vec<NtfsNode>
 }
 

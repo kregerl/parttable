@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 use crate::{
-    guid::Guid, log_todo, mapped_disk::{BufferedMappedDisk, MappedDisk, MappedDiskResult}, ntfs::tree::TreeNavigator
+    guid::Guid, log_todo, mapped_disk::{BufferedMappedDisk, MappedDisk, MappedDiskResult}, ntfs::tree::{Arena, TreeNavigator}
 };
 use binary_struct::{prelude::*, BinaryStruct, Skip};
 use bitmask_enum::bitmask;

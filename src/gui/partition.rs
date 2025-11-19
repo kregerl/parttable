@@ -15,11 +15,7 @@ pub fn show(ui: &mut egui::Ui, ctx: &egui::Context, disk_context: &mut DiskConte
             _ => None
         };
         if let Some(starting_lba) = maybe_starting_lba {
-            let before_pbr = disk_context.disk.current_offset();
-            debug!("before PBR: {:#?}", starting_lba * 512);
             let partition_boot_record = parse_pbr(&disk_context.disk, starting_lba).unwrap();
-            debug!("After PBR: {:#?}", disk_context.disk.current_offset());
-            debug!("Difference: {}", disk_context.disk.current_offset() - before_pbr);
             let mut fs_reader = NtfsReader::new(
                 &disk_context.disk,
                 &partition_boot_record,
