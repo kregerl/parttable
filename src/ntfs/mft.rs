@@ -1,11 +1,12 @@
-use std::collections::HashMap;
-
 use crate::{
-    guid::Guid, log_todo, mapped_disk::{BufferedMappedDisk, MappedDisk, MappedDiskResult}, ntfs::tree::{Arena, TreeNavigator}
+    guid::Guid,
+    log_todo,
+    mapped_disk::{BufferedMappedDisk, MappedDisk, MappedDiskResult},
+    ntfs::tree::{Arena, NtfsTree},
 };
 use binary_struct::{prelude::*, BinaryStruct, Skip};
 use bitmask_enum::bitmask;
-use eframe::glow::ATOMIC_COUNTER_BUFFER_INDEX;
+use log::{debug, info};
 
 use super::pbr::{validate_pbr, NtfsPartitionBootRecord};
 
@@ -920,7 +921,11 @@ pub fn parse_attribute<'a>(
         }
         0x80 => {
             // $DATA
-            if attribute_header.common().non_resident_flag.contains(NonResidentFlags::NonResident) {
+            if attribute_header
+                .common()
+                .non_resident_flag
+                .contains(NonResidentFlags::NonResident)
+            {
                 let dataruns = parse_dataruns(disk).unwrap();
                 println!("DataRun Attribute: {:#?}", dataruns);
                 Some(Attribute::Data(dataruns))
@@ -1254,74 +1259,82 @@ pub fn patch_update_sequence(
 pub fn parse_mft(
     fs_reader: &mut NtfsReader,
     partition_boot_record: &NtfsPartitionBootRecord,
-) -> MappedDiskResult<()> {
+) -> MappedDiskResult<NtfsTree> {
     let starting_lba = validate_pbr(
         partition_boot_record,
         fs_reader.starting_lba_of_filesystem as u64,
     )
     .unwrap();
-    let mut tree = TreeNavigator::new(0);
-    tree.create_root("Root");
-    println!("starting_lba: {}", starting_lba);
+
+    let mut tree = NtfsTree::new();
+    debug!("Starting LBA: {}", starting_lba);
     let mut current_offset = fs_reader.byte_offset_from_lba(starting_lba);
-    println!(
-        "Total size: {}",
+    debug!(
+        "Partition total size: {}",
         fs_reader.byte_offset_from_lba(partition_boot_record.number_of_sectors_in_volume())
     );
     while current_offset + partition_boot_record.mft_size()
         <= fs_reader.byte_offset_from_lba(partition_boot_record.number_of_sectors_in_volume())
     {
-        println!(
-            "Current: {}",
+        debug!(
+            "Current offset: {}",
             current_offset + partition_boot_record.mft_size()
         );
         fs_reader.disk.set_cursor(current_offset).unwrap();
         let file_descriptor = fs_reader.disk.read::<MftFileRecord>().unwrap();
 
-        if file_descriptor.signature == "FILE" {
-            let record_number = (current_offset - fs_reader.byte_offset_from_lba(starting_lba))
-                / partition_boot_record.mft_size();
-            println!("Entry number: {}", record_number);
-            println!("MftFileDescriptor: {:#?}", file_descriptor);
-            fs_reader
-                .disk
-                .set_cursor(current_offset + file_descriptor.offest_of_update_seq as usize)
-                .unwrap();
-            let update_sequence_number = fs_reader.disk.read::<u16>().unwrap();
-            let update_sequence_array = fs_reader
-                .disk
-                .read_bytes((file_descriptor.size_of_update_seq as usize - 1) * 2)
+        match file_descriptor.signature.as_str() {
+            "FILE" => {
+                if current_offset >= 256372736 {
+                    println!("IS MIRROR")
+                }
+                let record_number = (current_offset - fs_reader.byte_offset_from_lba(starting_lba))
+                    / partition_boot_record.mft_size();
+                debug!("Record number: {}", record_number);
+                println!("MftFileDescriptor: {:#?}", file_descriptor);
+                fs_reader
+                    .disk
+                    .set_cursor(current_offset + file_descriptor.offest_of_update_seq as usize)
+                    .unwrap();
+                let update_sequence_number = fs_reader.disk.read::<u16>().unwrap();
+                let update_sequence_array = fs_reader
+                    .disk
+                    .read_bytes((file_descriptor.size_of_update_seq as usize - 1) * 2)
+                    .unwrap();
+
+                let mut buffered_mapped_disk =
+                    BufferedMappedDisk::new(fs_reader.disk, partition_boot_record.mft_size());
+                buffered_mapped_disk.fill_buffer_at(current_offset).unwrap();
+                patch_update_sequence(
+                    &mut buffered_mapped_disk,
+                    partition_boot_record.sector_size() as usize,
+                    update_sequence_number,
+                    &update_sequence_array,
+                )
                 .unwrap();
 
-            let mut buffered_mapped_disk =
-                BufferedMappedDisk::new(fs_reader.disk, partition_boot_record.mft_size());
-            buffered_mapped_disk.fill_buffer_at(current_offset).unwrap();
-            patch_update_sequence(
-                &mut buffered_mapped_disk,
-                partition_boot_record.sector_size() as usize,
-                update_sequence_number,
-                &update_sequence_array,
-            )
-            .unwrap();
-
-            let attributes = parse_file_attributes(
-                &buffered_mapped_disk,
-                current_offset + file_descriptor.offset_first_attribute as usize,
-                ParsingContext { record_number },
-            )
-            .unwrap();
-            println!("Attributes: {:#?}", attributes);
-            for attribute in attributes {
-                if let Attribute::FileName(name_attr) = attribute {
-                    tree.add(&name_attr.name);
+                let attributes = parse_file_attributes(
+                    &buffered_mapped_disk,
+                    current_offset + file_descriptor.offset_first_attribute as usize,
+                    ParsingContext { record_number },
+                )
+                .unwrap();
+                println!("Attributes: {:#?}", attributes);
+                for attribute in attributes {
+                    if let Attribute::FileName(name_attr) = attribute {
+                        tree.add_entry(
+                            &name_attr.name,
+                            record_number,
+                            name_attr.reference_to_parent_dir.record_index as usize,
+                        );
+                    }
                 }
             }
-        } else {
-            // TODO: Skip
+            "BAAD" => info!("Found corrupted MFT record {}", current_offset),
+            _ => {}
         }
         current_offset += partition_boot_record.mft_size();
     }
     println!("File Tree: {:#?}", tree);
-
-    Ok(())
+    Ok(tree)
 }

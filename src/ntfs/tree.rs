@@ -1,14 +1,19 @@
+use std::collections::HashMap;
+
+use log::warn;
+
 
 #[derive(Debug)]
-struct NtfsNode {
-    name: String,
-    parent: Option<usize>,
-    children: Vec<usize>,
+pub struct NtfsNode {
+    pub name: String,
+    pub parent: Option<usize>,
+    pub children: Vec<usize>,
+    pub mft_record: usize,
 }
 
 #[derive(Debug)]
 pub struct Arena {
-    nodes: Vec<NtfsNode>
+    pub nodes: Vec<NtfsNode>
 }
 
 impl Arena {
@@ -18,84 +23,103 @@ impl Arena {
         }
     }
 
-    fn add_node(&mut self, name: &str, parent: Option<usize>) -> usize {
+    fn add_node(&mut self, name: &str, mft_record: usize) -> usize {
         let node_id = self.nodes.len();
         self.nodes.push(NtfsNode {
             name: name.to_string(),
-            parent,
+            parent: None,
             children: Vec::new(),
+            mft_record
         });
-        if let Some(parent_id) = parent {
-            self.nodes[parent_id].children.push(node_id);
-        }
         node_id
     }
 
-    fn get(&self, node_id: usize) -> &NtfsNode {
-        &self.nodes[node_id]
+    fn link_parent_child(&mut self, parent_id: usize, child_id: usize) {
+        if self.is_descendant(parent_id, child_id) {
+            warn!(
+                "Cannot link parent {} to child {}: would create a cycle",
+                parent_id, child_id
+            );
+            return;
+        }
+
+        self.nodes[child_id].parent = Some(parent_id);
+        self.nodes[parent_id].children.push(child_id);
+    }
+
+    fn is_descendant(&self, potential_ancestor: usize, node_id: usize) -> bool {
+        let mut stack = vec![potential_ancestor];
+
+        while let Some(current) = stack.pop() {
+            if current == node_id {
+                return true; // cycle detected
+            }
+            stack.extend(&self.nodes[current].children);
+        }
+
+        false
     }
 }
 
 #[derive(Debug)]
-pub struct TreeNavigator {
-    arena: Arena,
-    current: usize,
-    history: Vec<usize>,
+pub struct NtfsTree {
+    pub arena: Arena,
+    mft_to_node: HashMap<usize, usize>,
+    pending_children: HashMap<usize, Vec<usize>>,
+    root: Option<usize>,
 }
 
-impl TreeNavigator {
-    pub fn new(start: usize) -> Self {
+impl NtfsTree {
+    pub fn new() -> Self {
         Self {
             arena: Arena::new(),
-            current: start,
-            history: Vec::new(),
+            mft_to_node: HashMap::new(),
+            pending_children: HashMap::new(),
+            root: None,
         }
     }
 
-    fn current(&self) -> &NtfsNode {
-        &self.arena.nodes[self.current]
-    }
+    pub fn add_entry(&mut self, name: &str, mft_record: usize, parent_mft: usize) {
+        let node_id = self.arena.add_node(name, mft_record);
+        self.mft_to_node.insert(mft_record, node_id);
 
-    fn get(&self, node_id: usize) -> &NtfsNode {
-        &self.arena.get(node_id)
-    }
+        if parent_mft == mft_record {
+            self.root = Some(node_id);
+        }
 
-    pub fn create_root(&mut self, name: &str) {
-        let node_id=self.arena.add_node(name, None);
-        self.enter(node_id);
-    }
+        if let Some(&parent_id) = self.mft_to_node.get(&parent_mft) {
+            self.arena.link_parent_child(parent_id, node_id);
+        } else {
+            self.pending_children
+                .entry(parent_mft)
+                .or_default()
+                .push(node_id);
+        }
 
-    fn enter(&mut self, node_id: usize) {
-        self.history.push(self.current);
-        self.current = node_id;
-    }
-
-    pub fn add(&mut self, name: &str) {
-        self.arena.add_node(name, Some(self.current));
-    }
-
-    fn add_and_enter(&mut self, name: &str) {
-        let node_id = self.arena.add_node(name, Some(self.current));
-        self.enter(node_id);
-    }
-
-    fn pop(&mut self) {
-        if let Some(previous) = self.history.pop() {
-            self.current = previous
+        if let Some(children) = self.pending_children.remove(&mft_record) {
+            for child in children {
+                self.arena.link_parent_child(node_id, child);
+            }
         }
     }
-}
 
-#[test]
-fn tree_test() {
-    let mut nav = TreeNavigator::new(0);
-    nav.create_root("Root");
-    nav.add_and_enter("Folder 1");
-    nav.add("File 1.txt");
-    nav.pop();
-    nav.add("Folder 2");
-    nav.pop();
+    pub fn get(&self, node_id: usize) -> &NtfsNode {
+        &self.arena.nodes[node_id]
+    }
 
-    println!("nav: {:#?}", nav);
-    println!("nav: {:#?}", nav.arena.nodes);
+    pub fn get_ordered_nodes(&self) -> Vec<usize> {
+        let mut result = Vec::new();
+
+        if let Some(root_id) = self.root {
+            self.collect_nodes_recursive(root_id, &mut result);
+        }
+        result
+    }
+
+    fn collect_nodes_recursive(&self, parent_id: usize, result: &mut Vec<usize>) {
+        result.push(parent_id);
+        for child in &self.arena.nodes[parent_id].children {
+            self.collect_nodes_recursive(*child, result);
+        }
+    }
 }
